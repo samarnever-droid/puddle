@@ -1,0 +1,165 @@
+[
+ {
+  "engine": "puddle",
+  "note": "default config, committed acks, vectorized executor, btree index; psycopg2 driver",
+  "start_s": 0.05,
+  "idle_mb": 2.9,
+  "load_s": 1.755,
+  "load_rps": 113933,
+  "point_noindex_ms": 11.527,
+  "index_build_ms": 39.6,
+  "loaded_mb": 57.6,
+  "ms": {
+   "scan+filter+count": 11.542,
+   "group-by+aggs": 43.425,
+   "scan+like+aggs": 30.659,
+   "equi-join+agg": 97.239,
+   "order-by top-k": 117.044,
+   "left-join anti": 73.187,
+   "case+mod+group": 70.515
+  },
+  "idx": {
+   "point-select": 0.069,
+   "range-1000": 0.15,
+   "in-list-10": 0.066
+  },
+  "qps": 44911,
+  "p50_ms": 0.108,
+  "p99_ms": 0.994,
+  "peak_mb": 64.3
+ },
+ {
+  "engine": "postgresql",
+  "note": "PostgreSQL 17, initdb defaults (shared_buffers 128MB), trust auth, tmpfs datadir; psycopg2 driver -- same client+protocol as puddle",
+  "start_s": 0.54,
+  "idle_mb": 27.9,
+  "load_s": 1.965,
+  "load_rps": 101761,
+  "point_noindex_ms": 11.706,
+  "index_build_ms": 46.2,
+  "loaded_mb": 27.6,
+  "ms": {
+   "scan+filter+count": 10.928,
+   "group-by+aggs": 21.632,
+   "scan+like+aggs": 17.101,
+   "equi-join+agg": 59.179,
+   "order-by top-k": 25.538,
+   "left-join anti": 24.843,
+   "case+mod+group": 22.273
+  },
+  "idx": {
+   "point-select": 0.116,
+   "range-1000": 0.2,
+   "in-list-10": 0.118
+  },
+  "qps": 17314,
+  "p50_ms": 0.401,
+  "p99_ms": 1.243,
+  "peak_mb": 27.6
+ },
+ {
+  "engine": "mariadb",
+  "note": "MariaDB 11.8 (MySQL family), InnoDB, default buffer pool, skip-grant-tables (auth only), tmpfs datadir; mariadb C connector",
+  "start_s": 0.45,
+  "idle_mb": 113.8,
+  "load_s": 0.671,
+  "load_rps": 298067,
+  "point_noindex_ms": 38.675,
+  "index_build_ms": 111.6,
+  "loaded_mb": 151.9,
+  "ms": {
+   "scan+filter+count": 18.496,
+   "group-by+aggs": 75.643,
+   "scan+like+aggs": 51.95,
+   "equi-join+agg": 1508.714,
+   "order-by top-k": 47.46,
+   "left-join anti": 837.878,
+   "case+mod+group": 103.726
+  },
+  "idx": {
+   "point-select": 0.146,
+   "range-1000": 0.343,
+   "in-list-10": 0.132
+  },
+  "qps": 15829,
+  "p50_ms": 0.413,
+  "p99_ms": 1.54,
+  "peak_mb": 154.0
+ },
+ {
+  "engine": "sqlite",
+  "note": "SQLite (stdlib sqlite3), file DB on tmpfs, WAL + synchronous=NORMAL, in-process (RSS = python PSS delta); C driver",
+  "start_s": 0.0,
+  "idle_mb": 0.0,
+  "load_s": 0.265,
+  "load_rps": 753454,
+  "point_noindex_ms": 7.369,
+  "index_build_ms": 45.8,
+  "loaded_mb": 3.3,
+  "ms": {
+   "scan+filter+count": 1.288,
+   "group-by+aggs": 39.951,
+   "scan+like+aggs": 15.695,
+   "equi-join+agg": 77.966,
+   "order-by top-k": 50.257,
+   "left-join anti": 38.338,
+   "case+mod+group": 57.328
+  },
+  "idx": {
+   "point-select": 0.009,
+   "range-1000": 0.032,
+   "in-list-10": 0.009
+  },
+  "qps": 57469,
+  "p50_ms": 0.095,
+  "p99_ms": 0.589,
+  "peak_mb": 41.7
+ },
+ {
+  "engine": "mongodb",
+  "note": "MongoDB 8.0, WiredTiger cache capped 256MB (sandbox RAM), tmpfs dbpath, indexes on bench_big.a + bench_dim.g; pymongo driver",
+  "start_s": 0.65,
+  "idle_mb": 164.1,
+  "load_s": 1.446,
+  "load_rps": 138338,
+  "point_noindex_ms": 32.042,
+  "index_build_ms": 232.0,
+  "loaded_mb": 229.1,
+  "ms": {
+   "scan+filter+count": 16.445,
+   "group-by+aggs": 105.609,
+   "scan+like+aggs": 120.713,
+   "equi-join+agg": 7679.642,
+   "order-by top-k": 118.418,
+   "left-join anti": 1536.91,
+   "case+mod+group": 185.533
+  },
+  "idx": {
+   "point-select": 0.306,
+   "range-1000": 0.569,
+   "in-list-10": 0.437
+  },
+  "qps": 6213,
+  "p50_ms": 0.803,
+  "p99_ms": 7.574,
+  "peak_mb": 234.4
+ },
+ {
+  "engine": "redis",
+  "note": "Redis 8.0, in-memory, persistence OFF (--save '' --appendonly no); rows as hashes big:<a>; analytics/range N/A by data model; redis-py driver",
+  "start_s": 0.05,
+  "idle_mb": 9.6,
+  "load_s": 3.014,
+  "load_rps": 66358,
+  "index_build_ms": 0.0,
+  "loaded_mb": 34.5,
+  "ms": {},
+  "idx": {
+   "point-select": 0.102
+  },
+  "qps": 8902,
+  "p50_ms": 0.638,
+  "p99_ms": 3.898,
+  "peak_mb": 33.6
+ }
+]

@@ -1,0 +1,40 @@
+[package]
+name = "puddle"
+version = "0.1.0"
+edition = "2021"
+description = "puddle - a lightweight lakehouse that speaks PostgreSQL and lives in an S3 bucket"
+license = "MIT"
+
+[dependencies]
+regex = "1"
+# everything hand-built except: TLS+HTTP for S3, manifest JSON, chunk compression,
+# and SHA-256/HMAC (SigV4 + SCRAM). all small, audited, RAM-cheap.
+ureq = "2"
+rcgen = "0.13"
+rustls = "0.23"
+rustls-pemfile = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+lz4_flex = "0.11"
+sha2 = "0.10"
+hmac = "0.12"
+
+# ---- no-stubs policy --------------------------------------------------
+# Enforced by `cargo clippy` (the crate attributes are inert under plain
+# rustc). forbid = cannot be re-allowed locally, not even in tests.
+#   todo / unimplemented : placeholder macros
+#   dbg_macro            : debug leftovers
+#   unreachable          : panic paths; unsupported input must return a
+#                          SQLSTATE error, never crash the server
+[lints.clippy]
+todo = "forbid"
+unimplemented = "forbid"
+dbg_macro = "forbid"
+unreachable = "forbid"
+
+[profile.release]
+opt-level = 3
+debug = false
+
+[profile.test]
+opt-level = 1
