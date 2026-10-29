@@ -1,9 +1,19 @@
 [package]
 name = "puddle"
-version = "0.1.0"
+version = "2.2.0"
 edition = "2021"
 description = "puddle - a lightweight lakehouse that speaks PostgreSQL and lives in an S3 bucket"
 license = "MIT"
+
+[lib]
+name = "puddle"
+path = "src/lib.rs"
+# rlib: link from Rust; cdylib: link from C / Python ctypes / anything FFI
+crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "puddle"
+path = "src/main.rs"
 
 [dependencies]
 regex = "1"

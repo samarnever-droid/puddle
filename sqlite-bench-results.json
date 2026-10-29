@@ -1,0 +1,80 @@
+{
+ "point-lookup": {
+  "puddle_ms": 0.0864,
+  "sqlite_ms": 0.0074,
+  "ratio": 11.63,
+  "category": "rt"
+ },
+ "range-100": {
+  "puddle_ms": 0.0998,
+  "sqlite_ms": 0.019,
+  "ratio": 5.27,
+  "category": "rt"
+ },
+ "full-scan-sum": {
+  "puddle_ms": 4.5486,
+  "sqlite_ms": 10.3278,
+  "ratio": 0.44,
+  "category": "batch"
+ },
+ "groupby-20": {
+  "puddle_ms": 14.2632,
+  "sqlite_ms": 35.015,
+  "ratio": 0.41,
+  "category": "batch"
+ },
+ "groupby-filter-having": {
+  "puddle_ms": 13.2066,
+  "sqlite_ms": 28.7791,
+  "ratio": 0.46,
+  "category": "batch"
+ },
+ "topk-10": {
+  "puddle_ms": 7.0583,
+  "sqlite_ms": 22.1464,
+  "ratio": 0.32,
+  "category": "batch"
+ },
+ "topk-100-offset": {
+  "puddle_ms": 13.2842,
+  "sqlite_ms": 64.7691,
+  "ratio": 0.21,
+  "category": "batch"
+ },
+ "like-filter": {
+  "puddle_ms": 3.9859,
+  "sqlite_ms": 7.4968,
+  "ratio": 0.53,
+  "category": "batch"
+ },
+ "distinct-count": {
+  "puddle_ms": 6.6154,
+  "sqlite_ms": 6.6828,
+  "ratio": 0.99,
+  "category": "batch"
+ },
+ "update-point": {
+  "puddle_ms": 0.1,
+  "sqlite_ms": 0.0021,
+  "ratio": 48.45,
+  "category": "rt"
+ },
+ "insert-single": {
+  "puddle_ms": 0.1011,
+  "sqlite_ms": 0.0028,
+  "ratio": 35.65,
+  "category": "write"
+ },
+ "insert-multi-100": {
+  "puddle_ms": 1.5329,
+  "sqlite_ms": 0.1336,
+  "ratio": 11.47,
+  "category": "write"
+ },
+ "delete-reinsert": {
+  "puddle_ms": 0.6348,
+  "sqlite_ms": 0.1157,
+  "ratio": 5.48,
+  "category": "write"
+ }
+}

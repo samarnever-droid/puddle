@@ -49,7 +49,8 @@ TLS + SCRAM (dual-mode port: TLS and cleartext on 5433, or require TLS):
   (RFC 5802 — hand-rolled PBKDF2/proofs, gs2 `n,,`/`y,,`, channel-binding
   safe); unknown users get a dummy exchange so failures are
   indistinguishable. TLS via rustls, self-signed or your cert.
-* **SQL**: `SELECT` with INNER/LEFT JOIN, GROUP BY + HAVING, aggregates
+* **SQL**: `SELECT` with INNER/LEFT/RIGHT/FULL/CROSS JOIN and
+  `JOIN ... USING`, GROUP BY + HAVING, aggregates
   (count/sum/avg/min/max, DISTINCT), ORDER BY + NULLS FIRST/LAST,
   LIMIT/OFFSET, CASE, LIKE, IN, BETWEEN, IS NULL, CAST, scalar functions,
   correlated arithmetic, scalar subqueries (uncorrelated), `UNION [ALL]`,
@@ -68,6 +69,60 @@ TLS + SCRAM (dual-mode port: TLS and cleartext on 5433, or require TLS):
   interval arithmetic with PG's exact display conventions, `sum(interval)`,
   casts, comparisons, ORDER BY/GROUP BY/indexes over temporal columns —
   all matching real PostgreSQL 17 output (verified side-by-side).
+* **Analytics SQL (v2.1)**: derived tables (`FROM (SELECT ...) x(a, b)`),
+  CTEs (`WITH name [(cols)] AS (SELECT ...) [, ...]` — materialize-once,
+  PG declaration-order visibility, innermost shadowing, nested WITH;
+  `WITH RECURSIVE` is a clean `0A000`), `IN (SELECT ...)`, scalar
+  subqueries in DML (`UPDATE ... WHERE id = (SELECT ...)`, same for
+  DELETE/SET), `INSERT INTO t [(cols)] SELECT ...` (source runs to
+  completion before the write lock — self-inserts are safe), and
+  **UPSERT**: `INSERT ... ON CONFLICT (col) DO NOTHING | DO UPDATE SET
+  ... [WHERE guard]` with the `excluded` pseudo-table, `21000` on
+  affecting a row twice, `42P10` when no index matches the target.
+* **Window functions (v2.1)**: `OVER (PARTITION BY ... ORDER BY ...
+  [frame])` on row_number, rank, dense_rank, percent_rank, cume_dist,
+  ntile, lag/lead (offset + default), first_value, last_value,
+  nth_value, and count/sum/min/max/avg aggregates over frames. Frames:
+  `ROWS BETWEEN {UNBOUNDED PRECEDING | n PRECEDING | CURRENT ROW} AND
+  {CURRENT ROW | n FOLLOWING | UNBOUNDED FOLLOWING}` plus `RANGE` with
+  UNBOUNDED/CURRENT bounds (PG's default frame, peers included).
+  Windows compose with GROUP BY (specs may embed aggregates:
+  `rank() OVER (ORDER BY sum(v))`), DISTINCT, and ORDER BY; windows in
+  GROUP BY/HAVING are rejected like PG. Named windows
+  (`WINDOW w AS (...)`, `OVER w`, with PARTITION/ORDER/frame overrides
+  where PG allows them) and `FILTER (WHERE ...)` on aggregates — plain
+  and windowed — are supported (v2.2).
+* **SQL surface completion (v2.2)**: `RIGHT`/`FULL OUTER JOIN` (the
+  hash-join engine runs the probe/build sides swapped or null-extends
+  both, matching PG row order for matched rows), `JOIN ... USING (col)`,
+  table-less `VALUES` lists (`VALUES (1,'a'),(2,'b')`, in FROM with
+  aliases, and as INSERT sources), and **`WITH RECURSIVE`** —
+  `UNION ALL`/`UNION` work-table iteration with the standard
+  anchor/recursive arm split (delta or whole-work-table semantics per
+  the set operator). A generous iteration cap (54,000) turns runaway
+  recursion into a `54000` error instead of an OOM — PG has no cap,
+  a documented divergence.
+* **Constraints (v2.2)**: `PRIMARY KEY`, `UNIQUE`, `CHECK (expr)`, and
+  `DEFAULT expr` — column-level and table-level forms. Each PK/UNIQUE
+  column gets a real implicit index (`<t>_pkey`, `<t>_<col>_key`)
+  maintained on every DML path, so enforcement is an index probe, not a
+  table scan: `23505` on duplicates (including within one INSERT batch),
+  `23502` on NOT NULL, `23514` on CHECK (which passes on TRUE or NULL,
+  like PG). `DEFAULT` fills omitted columns in INSERT and COPY. Explicit
+  `CREATE UNIQUE INDEX` (rejected with `23505` if existing rows already
+  violate it) enforces the same way and is user-droppable; the implicit
+  constraint indexes are not (`0A000`). Everything persists: constraint
+  metadata rides the WAL (a new record kind — old logs replay untouched)
+  and the manifest, and recovery rebuilds the implicit indexes.
+  `ON CONFLICT` now requires a genuinely unique arbiter (a constraint
+  index or a `CREATE UNIQUE INDEX`) — no more approximation — and PG
+  error precedence (`0A000`/`42703`/`42P10` before execution).
+* **Embed without TCP (v2.2)**: `libpuddle.so` exposes a C ABI
+  (`puddle_open`/`puddle_exec`/`puddle_result_*`/`puddle_close`) — link
+  it and you have the whole engine in-process, zero sockets, durable
+  file: URIs included; plus a unix-socket listen mode
+  (`--bind unix:/path/to/sock`) for psql/psycopg2 over a local socket
+  with no TCP stack in the middle.
 * **Snapshots + time travel (v2.0)**: `CREATE SNAPSHOT name` pins an
   LSN-addressed, immutable view of the whole database in one meta.json CAS
   (Neon-style: the snapshot is just a pointer; data is never copied).
@@ -108,6 +163,29 @@ TLS + SCRAM (dual-mode port: TLS and cleartext on 5433, or require TLS):
 
 Load rate 161K rows/s. Full run: `python3 tests/bench.py`.
 
+### Head-to-head vs SQLite in-process (v2.1, 100K rows, same shapes)
+
+SQLite runs inside the client process with no wire — puddle answers over
+TCP + libpq. That handicap stated plainly, on the same 13 shapes
+(`python3 tests/bench_vs_sqlite.py`, min-of-runs on a dev sandbox):
+
+| shape | puddle | sqlite | verdict |
+|---|---|---|---|
+| full-scan sum | 4.5 ms | 10.3 ms | **puddle 2.3× faster** |
+| group-by 20 + aggs | 14.3 ms | 35.0 ms | **puddle 2.5× faster** |
+| group-by + HAVING | 13.2 ms | 28.8 ms | **puddle 2.2× faster** |
+| top-k (ORDER BY + LIMIT 10) | 7.1 ms | 22.1 ms | **puddle 3.1× faster** |
+| top-k + OFFSET 5000 | 13.3 ms | 64.8 ms | **puddle 4.9× faster** |
+| LIKE filter | 4.0 ms | 7.5 ms | **puddle 1.9× faster** |
+| distinct count | 6.6 ms | 6.7 ms | **puddle 1.0× (tie)** |
+| point lookup / point UPDATE / single INSERT | ~90–100 µs | ~2–7 µs | sqlite — the gap is the TCP + libpq round trip, not the engine |
+
+The v2.1 optimizer work behind those numbers: UPDATE/DELETE route
+through the secondary-index prefilter (point UPDATE 11.5 ms → 0.06 ms on
+the same hardware class), ORDER BY + LIMIT uses bounded top-k selection
+instead of a full sort (35.6 ms → 6.0 ms), and LIKE over a literal
+pattern borrows instead of cloning per row (18 ms → 1.1 ms).
+
 ## Memory contract
 
 Idle **1.4 MB** (1.6 MB with TLS). 100 live connections: 4.2 MB. 200K rows
@@ -139,7 +217,7 @@ exit 101). The gate is:
 
 ```
 cargo clippy --release --all-targets -- -D warnings   # zero warnings
-cargo test --release                                  # 18 unit tests
+cargo test --release                                  # 31 unit tests
 ```
 
 Semantically: anything unsupported returns a SQLSTATE error (`0A000`
@@ -150,7 +228,8 @@ constraints defined, real PostgreSQL also returns zero rows there.)
 
 ## The test suite (M7: "harder than Silicon tests")
 
-15 suites, all green: 58-check SQL regression, 53-check **psql battery**
+16 suites, all green: 171-check SQL regression, a 124-check **feature
+battery** (v2.2 surface incl. constraints, restart-phased), 53-check **psql battery**
 (real `psql` binary: `\l`/`\dt`/`\d`, server- and client-side COPY
 round-trips, ALTER + kill -9 restart, psycopg2 `copy_expert`, kill -9
 *mid-COPY*), 156-check differential
@@ -187,9 +266,26 @@ puddle [--bind IP] [--port N] --data file:///DIR | s3://BUCKET/PREFIX
 * Binary parameter format is rejected (`0A000`); binary *results* work.
 * COPY uses the simple protocol only (extended-protocol COPY → `0A000`),
   and COPY inside an explicit transaction is `0A000` in v1.1.
-* Scalar subqueries are uncorrelated-only (a correlated reference fails
-  with a clean `42703`, never a silent wrong answer).
-* No window functions, no CTEs, no `INSERT ... SELECT`, no array values.
+* No array values.
+* Constraints are single-column: `PRIMARY KEY (a, b)` / multi-column
+  UNIQUE/CHECK table constraints parse as a clean syntax error. No
+  FOREIGN KEY / REFERENCES, no EXCLUDE, no DEFERRABLE, no user-chosen
+  constraint names (they are the PG defaults `<t>_pkey`,
+  `<t>_<col>_key`, `<t>_<col>_check`), no `ALTER TABLE ... ADD
+  CONSTRAINT`, no sequences (so no `DEFAULT nextval(...)` — defaults
+  are constant expressions). UNIQUE is always `NULLS DISTINCT` (PG's
+  default; `NULLS NOT DISTINCT` is not parsed).
+* `JOIN ... USING` does not merge the output columns the way PG does:
+  both copies stay in scope, so a bare `SELECT id` over
+  `a JOIN b USING (id)` is still ambiguous — qualify it.
+* ON CONFLICT arbiters are single-column (puddle indexes are); an
+  untargeted `ON CONFLICT` requires exactly one unique-enforcing index
+  on the table.
+* Window frames: `RANGE` with numeric offsets and `EXCLUDE` clauses are
+  not supported; window queries run on the reference executor (no
+  vecx).
+* Scalar and IN subqueries are uncorrelated-only (PG's correlated forms
+  fail with a clean `42703`, never a silent wrong answer).
 * Temporal limits: `timestamptz` parses as plain timestamp (no zone
   math), `extract` returns double (PG returns numeric), typed literals
   fail with `42601` instead of PG's `22007`, nominal-equal intervals

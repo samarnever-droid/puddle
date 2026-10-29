@@ -159,6 +159,84 @@ LSN-addressed immutable layers, Neon-pageserver-shaped:
   inside BEGIN while `log_txn` stays a no-op there (a rolled-back txn
   must never leave a segment)
 
+## Query features (v2.1)
+
+- **Derived tables / CTEs**: `FROM (SELECT ...)` executes the subquery via the normal
+  `execute` entry point and adopts its output as the relation (schema via recursive
+  `describe`, never executed — so Describe on prepared statements works). CTEs are a
+  thread-local stack of frames (one connection = one thread): materialize-once with
+  memoization, PG declaration-order visibility (`in_flight` indices make self- and
+  forward references `42P01`), innermost shadowing. All RefCell borrows are short so
+  lookups re-enter freely. VecX stands down when a FROM name is defined by an active
+  frame (it reads the catalog directly and would otherwise miss the shadowing).
+- **INSERT ... SELECT**: the source query runs before the write lock; rows coerce per
+  target column (`42601` on arity mismatch).
+- **UPSERT**: the conflict arbiter is a btree index on the target column (single-column
+  indexes; `42P10` when none matches; an untargeted ON CONFLICT requires exactly one
+  index). DO UPDATE evaluates SET exprs with the existing row plus the proposed row
+  under `excluded`; the batch tracks affected keys (`21000` on a second touch); inserts
+  and updates land in one atomic WAL transaction with secondary-index maintenance.
+- **Window functions**: window calls in SELECT/ORDER BY are rewritten to `__win_k`
+  pseudo-columns; a window pass computes them over the WHERE-filtered rows (plain
+  queries) or the group rows (aggregate queries — window specs may embed aggregates,
+  split into the same AggSpec list so the group pass computes them). Partitioning by
+  gkey, stable sort by the spec's ORDER BY, peer groups for rank/dense_rank/cume_dist
+  and RANGE frames; ROWS frames as index ranges; cumulative frames get a running
+  aggregate. Window queries run on the reference executor.
+
+## SQL surface completion (v2.2)
+
+- **RIGHT / FULL OUTER JOIN**: the hash-join machinery runs with sides
+  swapped (RIGHT) or null-extends both directions (FULL); unmatched-row
+  emission matches PG's row order for matched rows. `JOIN ... USING (c)`
+  rewrites to the qualified equality at parse time — PG additionally
+  merges the two output columns, puddle keeps both (a bare column name
+  over a USING join stays ambiguous; documented).
+- **VALUES**: table-less `VALUES` rows become a SelectStmt with a
+  synthesized row-relation; usable standalone, as a derived table with
+  aliases, and as an INSERT ... source.
+- **WITH RECURSIVE**: anchor runs once; the recursive term iterates on
+  the delta (UNION ALL) or the whole working table (UNION) until it adds
+  no rows. A 54,000-iteration cap turns runaway recursion into a
+  `54000` error instead of an OOM (PG has no cap — documented
+  divergence). The self-reference in the anchor is `42P01`.
+- **Named windows + FILTER**: `WINDOW w AS (...)` + `OVER w` with
+  PG-legal PARTITION/ORDER/frame overrides (`42P10` on illegal
+  re-specification, `42704` on unknown names); `FILTER (WHERE ...)` on
+  plain aggregates (pre-aggregation row mask) and windowed aggregates
+  (per-accumulation mask, computed before the window pass peeks rows).
+- **Constraints**: `ColumnDef` carries pk/unique/default/check. CREATE
+  TABLE builds one implicit btree per PK/UNIQUE column
+  (`build_constraint_indexes`), flagged `internal` — invisible to DROP
+  INDEX (`0A000`), visible in `pg_indexes` like PG's constraint indexes.
+  Every DML staging path (INSERT VALUES, INSERT…SELECT, COPY IN, UPDATE
+  plan) runs `check_row_constraints` before touching the table: NOT NULL
+  (`23502`), CHECK via the scalar evaluator with the row bound as scope
+  (`23514`, passes on TRUE or NULL), UNIQUE via index probe + a
+  batch-local `pending` key set that catches intra-batch duplicates
+  (`23505`). `fill_defaults` const-evaluates DEFAULTs for omitted
+  columns (INSERT and COPY). UPDATE probes skip the row's own rowid.
+  ON CONFLICT resolves its arbiter at analysis time (PG error
+  precedence: `0A000`/`42703`/`42P10` before any execution) and requires
+  a genuinely unique index — implicit constraint index or explicit
+  `CREATE UNIQUE INDEX`; the arbiter column is exempt from the staging
+  unique check because the clause itself resolves those conflicts.
+  Persistence: constraint metadata rides the WAL as a new
+  `Constraints` record after `Create` (older logs replay unchanged) and
+  the manifest's `ManCol` (serde-defaulted fields; exprs round-trip as
+  SQL text via the expr renderer and re-parse through
+  `parse_one("SELECT <expr>")`); recovery rebuilds the implicit indexes
+  after the explicit ones.
+
+## Embedding & local IPC (v2.2)
+
+- `libpuddle.so` exposes a C ABI (`puddle_open` with `mem:` and durable
+  `file:` URIs, `puddle_exec`, result accessors incl. NULL cells and
+  SQLSTATE-carrying errors, `puddle_result_free`, `puddle_close`).
+  ctypes-verified (26 checks): the whole engine with zero sockets.
+- `--bind unix:/path` listens on a unix domain socket; libpq connects
+  via `host=/path` with no TCP in the middle.
+
 ## Executor (M4)
 
 Two executors, one semantics:
@@ -374,7 +452,7 @@ because that's the point of the project.
   `[lints.clippy]` table in Cargo.toml sets `todo` / `unimplemented` /
   `dbg_macro` / `unreachable` to **forbid** (cannot be re-allowed locally);
   `cargo clippy --release --all-targets -- -D warnings` is gate #0 and is
-  zero-warning clean, `cargo test --release` runs 18 unit tests (store
+  zero-warning clean, `cargo test --release` runs 31 unit tests (store
   contract incl. CAS + range reads on Mem/File backends, part codec
   roundtrips raw/dict/RLE/LZ4 + corruption detection, WAL roundtrip, IKey
   total order, SCRAM vectors, CRC32C vectors, AWS SigV4 doc vector).
@@ -392,13 +470,15 @@ because that's the point of the project.
 
 ## M7 — the brutal test suite
 
-Thirteen suites, all green on v1.0.0 (psql is not installed in this
+Sixteen suites, all green on v2.2.0 (psql is not installed in this
 environment; psycopg2/libpq is the wire oracle):
 
 | suite | what it proves |
 |---|---|
-| `cargo test` (18) | crypto vectors, SCRAM exchange, sigv4 vs AWS docs |
-| `regression_test.py` (58) | full SQL surface semantics |
+| `feature_test.py` (124, v2.2) | full v2.2 surface: joins (all kinds + USING), VALUES, WITH RECURSIVE, named windows, FILTER, COPY, transactions, params, types, ON CONFLICT, CREATE UNIQUE INDEX, constraints — plus a `--phase2` rerun after restart + CHECKPOINT proving constraints survive both recovery paths |
+| `embed_test.py` (26, v2.2) | the C ABI: in-process engine over ctypes, zero TCP |
+| `cargo test` (31) | crypto vectors, SCRAM exchange, sigv4 vs AWS docs |
+| `regression_test.py` (171) | full SQL surface semantics |
 | `ext_test.py` (8) | extended protocol: named statements, portals, params |
 | `diff_test.py` (156) | vectorized executor == reference executor, incl. errors |
 | `durability_test.py` (8 rounds) | kill -9 at every stage; acked = durable; rollback stays rolled back |

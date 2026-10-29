@@ -9,8 +9,8 @@
 //! differential testing; anything this module doesn't cover falls back to it.
 
 use crate::engine::{
-    compare, coerce, eval_between, eval_bin, eval_func, eval_in, eval_like, gkey, GK, PqError,
-    Scope, Value,
+    compare, coerce, eval_between, eval_bin, eval_func, eval_in, eval_like, gkey, like_match, GK,
+    PqError, Scope, Value,
 };
 use crate::sql::Expr;
 use std::collections::HashMap;
@@ -61,6 +61,15 @@ pub fn veval(
     match e {
         Expr::Lit(v) => Ok(vec![v.clone(); n]),
         // subqueries are rewritten to literals before vectorized evaluation
+        Expr::InSub(..) => Err(PqError::new(
+            "XX000",
+            "internal error: unevaluated IN-subquery",
+        )),
+        // window queries always take the reference executor
+        Expr::Win { .. } => Err(PqError::new(
+            "XX000",
+            "internal error: window function in vectorized path",
+        )),
         Expr::Subquery(_) => Err(PqError::new(
             "XX000",
             "internal error: unevaluated scalar subquery",
@@ -142,6 +151,51 @@ pub fn veval(
                 .collect())
         }
         Expr::Like(l, r, neg) => {
+            // fast path: a literal pattern skips the per-row pattern
+            // clones, and a bare-column lhs skips the column clone too —
+            // everything borrows straight from the source columns. Same
+            // semantics as eval_like (nulls propagate, non-text errors).
+            if let Expr::Lit(Value::Text(pat)) = r.as_ref() {
+                let patb = pat.as_bytes();
+                let one = |x: &Value| -> R<Value> {
+                    match x {
+                        Value::Text(t) => {
+                            let m = like_match(t.as_bytes(), patb);
+                            Ok(Value::Bool(if *neg { !m } else { m }))
+                        }
+                        Value::Null => Ok(Value::Null),
+                        _ => Err(PqError::wrong_type("LIKE requires text operands")),
+                    }
+                };
+                match l.as_ref() {
+                    Expr::Col(name) => {
+                        let idx = scope.resolve(name)?;
+                        let col = src.col(idx);
+                        let mut out = Vec::with_capacity(n);
+                        for &i in sel {
+                            out.push(one(&col[i])?);
+                        }
+                        return Ok(out);
+                    }
+                    Expr::QCol(t, c) => {
+                        let idx = scope.resolve_q(t, c)?;
+                        let col = src.col(idx);
+                        let mut out = Vec::with_capacity(n);
+                        for &i in sel {
+                            out.push(one(&col[i])?);
+                        }
+                        return Ok(out);
+                    }
+                    _ => {
+                        let lv = veval(l, src, sel, scope, params)?;
+                        let mut out = Vec::with_capacity(n);
+                        for x in &lv {
+                            out.push(one(x)?);
+                        }
+                        return Ok(out);
+                    }
+                }
+            }
             let lv = veval(l, src, sel, scope, params)?;
             let rv = veval(r, src, sel, scope, params)?;
             let mut out = Vec::with_capacity(n);
@@ -256,12 +310,25 @@ pub fn veval(
 /// with the left keys. `left_keys[k][i]` is key part k for left row i.
 /// Returns (left row, Option<right row>) pairs; `None` only for LEFT joins
 /// without a match.
+/// Which unmatched rows an outer join keeps (and pads with NULLs).
+#[derive(Clone, Copy, PartialEq)]
+pub enum JoinMode {
+    Inner,
+    Left,
+    Right,
+    Full,
+}
+
+/// Hash equi-join. Output order: matched pairs left-major, then (for
+/// RIGHT/FULL) unmatched right rows appended. This exact order is a
+/// contract with the reference executor so the differential battery
+/// (vectorized == reference) holds for outer joins too.
 pub fn hash_join(
     nleft: usize,
     left_keys: &[Vec<Value>],
     right_keys: &[Vec<Value>],
-    left_join: bool,
-) -> Vec<(usize, Option<usize>)> {
+    mode: JoinMode,
+) -> Vec<(Option<usize>, Option<usize>)> {
     let nright = right_keys.first().map_or(0, |v| v.len());
     let mut map: HashMap<Vec<GK>, Vec<usize>> = HashMap::with_capacity(nright);
     for j in 0..nright {
@@ -272,25 +339,36 @@ pub fn hash_join(
         }
         map.entry(key).or_default().push(j);
     }
+    let keep_left = mode == JoinMode::Left || mode == JoinMode::Full;
+    let keep_right = mode == JoinMode::Right || mode == JoinMode::Full;
+    let mut right_matched = vec![false; nright];
     let mut out = Vec::new();
     for i in 0..nleft {
         let key: Vec<GK> = left_keys.iter().map(|k| gkey(&k[i])).collect();
         if key.iter().any(|k| matches!(k, GK::Null)) {
-            if left_join {
-                out.push((i, None));
+            if keep_left {
+                out.push((Some(i), None));
             }
             continue;
         }
         match map.get(&key) {
             Some(js) => {
                 for &j in js {
-                    out.push((i, Some(j)));
+                    right_matched[j] = true;
+                    out.push((Some(i), Some(j)));
                 }
             }
             None => {
-                if left_join {
-                    out.push((i, None));
+                if keep_left {
+                    out.push((Some(i), None));
                 }
+            }
+        }
+    }
+    if keep_right {
+        for (j, m) in right_matched.iter().enumerate() {
+            if !*m {
+                out.push((None, Some(j)));
             }
         }
     }

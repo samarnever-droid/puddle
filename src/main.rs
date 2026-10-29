@@ -1,31 +1,19 @@
 //! puddle — a lightweight lakehouse that speaks PostgreSQL and lives in an S3 bucket.
 //! M2: full reference SQL engine + extended query protocol (prepared statements).
 
-mod crc32c;
-mod engine;
-mod part;
-mod persist;
-mod s3;
-mod sql;
-mod auth;
-mod catalog;
-mod copy;
-mod store;
-mod temporal;
-mod vecx;
-mod wal;
-mod wire;
-
-use auth::Users;
-use engine::{Db, StmtResult, Ty, Value};
+// the engine lives in the `puddle` library crate (src/lib.rs): this binary
+// is just the TCP server wrapper around it. link the same code in-process
+// via `use puddle::...` (rlib) or the C ABI (src/ffi.rs, cdylib).
+use puddle::engine::{Db, StmtResult, Ty, Value};
+use puddle::VERSION;
+use puddle::{auth, catalog, copy, engine, sql, wire};
 use std::collections::HashMap;
 use std::io::Write;
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Single source of truth for the puddle version.
-const VERSION: &str = "2.0.0";
 use std::sync::Arc;
+use puddle::auth::Users;
 
 fn main() {
     // one explicit crypto provider for the whole process (rustls can't
@@ -44,6 +32,8 @@ fn main() {
     let mut tls_cert: Option<String> = None;
     let mut tls_key: Option<String> = None;
     let mut tls_self_signed = false;
+    // also listen on a Unix domain socket (psql -h /path/to/dir)
+    let mut unix_sock: Option<String> = None;
     let mut tls_required = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -58,6 +48,7 @@ fn main() {
             "--ack" => ack = args.next().unwrap_or_default(),
             "--auth" => auth_mode = args.next().unwrap_or_default(),
             "--auth-file" => auth_file = args.next(),
+            "--unix" => unix_sock = args.next(), // socket DIRECTORY
             "--tls-cert" => tls_cert = args.next(),
             "--tls-key" => tls_key = args.next(),
             "--tls" => tls_self_signed = true,
@@ -89,6 +80,7 @@ fn main() {
                 eprintln!("unknown option {}", a);
                 eprintln!("usage: puddle [--bind IP] [--port N]");
                 eprintln!("       puddle --data file:///dir | s3://bucket/prefix ");
+                eprintln!("              [--unix /sock/dir] (also listen on <dir>/.s.PGSQL.<port>)");
                 eprintln!("              [--endpoint URL] [--region R] [--access-key K] [--secret-key K]");
                 eprintln!("              [--ack relaxed|committed] [--vectorized on|off]");
                 eprintln!("              [--auth trust|password|scram-sha-256] [--auth-file users.json]");
@@ -114,73 +106,27 @@ auth file: JSON mapping user -> password / scram verifier (see docs)
 
     let db = match &data {
         Some(url) => {
-            let store: Box<dyn store::ObjectStore + Send + Sync> = if let Some(rest) =
-                url.strip_prefix("file://")
-            {
-                let dir = rest.trim_end_matches('/');
-                if let Err(e) = std::fs::create_dir_all(dir) {
-                    eprintln!("! cannot create data dir {}: {}", dir, e);
-                    std::process::exit(1);
-                }
-                Box::new(store::FileStore::new(dir).unwrap_or_else(|e| {
-                    eprintln!("! cannot open data dir {}: {}", dir, e);
-                    std::process::exit(1);
-                }))
-            } else if let Some(rest) = url.strip_prefix("s3://") {
-                let (bucket, prefix) = match rest.split_once('/') {
-                    Some((b, p)) => (b, p),
-                    None => (rest, ""),
-                };
-                let endpoint = endpoint
-                    .clone()
-                    .unwrap_or_else(|| "https://s3.amazonaws.com".into());
-                let region = region.clone().unwrap_or_else(|| "us-east-1".into());
-                let ak = access_key.clone().unwrap_or_default();
-                let sk = secret_key.clone().unwrap_or_default();
-                if ak.is_empty() || sk.is_empty() {
-                    eprintln!("! s3 storage needs --access-key/--secret-key (or AWS_* env)");
-                    std::process::exit(2);
-                }
-                Box::new(s3::S3Store::new(&endpoint, bucket, prefix, &region, &ak, &sk))
-            } else {
-                eprintln!("! --data must be file:///dir or s3://bucket/prefix (got {})", url);
-                std::process::exit(2);
-            };
-            let ack_level = match ack.as_str() {
-                "relaxed" => persist::AckLevel::Relaxed,
-                "committed" | "" => persist::AckLevel::Committed,
-                other => {
-                    eprintln!("! --ack must be relaxed|committed (got {})", other);
-                    std::process::exit(2);
-                }
-            };
-            eprintln!("* opening durable store: {} (ack={})", url, if ack_level == persist::AckLevel::Relaxed { "relaxed" } else { "committed" });
-            match persist::Persist::open(store, ack_level) {
-                Ok((p, tables)) => {
-                    let p = Arc::new(p);
-                    if ack_level == persist::AckLevel::Relaxed {
-                        let fp = p.clone();
-                        std::thread::Builder::new()
-                            .name("wal-flusher".into())
-                            .spawn(move || loop {
-                                std::thread::sleep(std::time::Duration::from_millis(500));
-                                if let Err(e) = fp.flush_all() {
-                                    eprintln!("! wal flusher: {}", e);
-                                }
-                            })
-                            .ok();
-                    }
-                    let n: usize = tables.values().map(|t| t.nrows()).sum();
-                    eprintln!("* recovered {} tables, {} rows", tables.len(), n);
-                    Arc::new(Db::from_parts(tables, p))
-                }
+            eprintln!(
+                "* opening durable store: {} (ack={})",
+                url,
+                if ack == "relaxed" { "relaxed" } else { "committed" }
+            );
+            match puddle::open_storage(
+                url,
+                endpoint.as_deref(),
+                region.as_deref(),
+                access_key.as_deref(),
+                secret_key.as_deref(),
+                &ack,
+            ) {
+                Ok(db) => db,
                 Err(e) => {
-                    eprintln!("! recovery failed: {}", e);
+                    eprintln!("! {}", e);
                     std::process::exit(1);
                 }
             }
         }
-        None => Arc::new(Db::new()),
+        None => puddle::open_memory(),
     };
     // ---- auth + TLS config (M6) ----
     let auth = match auth_mode.as_str() {
@@ -293,6 +239,70 @@ auth file: JSON mapping user -> password / scram verifier (see docs)
     eprintln!("* listening on {}:{}", bind, port);
 
     let next_pid = Arc::new(AtomicU64::new(1));
+
+    // optional Unix domain socket listener: same engine, same sessions,
+    // no TCP stack (psql -h <dir> picks the socket up by name)
+    if let Some(dir) = unix_sock {
+        // libpq derives the socket name from the directory + port exactly
+        // like PostgreSQL's default: <dir>/.s.PGSQL.<port>, so
+        // `psql -h <dir> -p <port>` just works.
+        let path = format!("{}/.s.PGSQL.{}", dir.trim_end_matches('/'), port);
+        if let Some(dir) = std::path::Path::new(&path).parent() {
+            if !dir.as_os_str().is_empty() {
+                if let Err(e) = std::fs::create_dir_all(dir) {
+                    eprintln!("! cannot create socket dir {}: {}", dir.display(), e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        // a stale socket file from a crashed server must not block us,
+        // but a LIVE server must: probe it before unlinking
+        if std::path::Path::new(&path).exists() {
+            match std::os::unix::net::UnixStream::connect(&path) {
+                Ok(_) => {
+                    eprintln!("! unix socket {} is served by a live puddle", path);
+                    std::process::exit(1);
+                }
+                Err(_) => {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+        let listener = match std::os::unix::net::UnixListener::bind(&path) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("! cannot bind unix socket {}: {}", path, e);
+                std::process::exit(1);
+            }
+        };
+        eprintln!("* listening on unix:{}", path);
+        let db = db.clone();
+        let next_pid = next_pid.clone();
+        let front = front.clone();
+        std::thread::Builder::new()
+            .name("unix-accept".into())
+            .spawn(move || {
+                for stream in listener.incoming() {
+                    match stream {
+                        Ok(s) => {
+                            let db = db.clone();
+                            let next_pid = next_pid.clone();
+                            let front = front.clone();
+                            std::thread::Builder::new()
+                                .stack_size(1024 * 1024)
+                                .spawn(move || {
+                                    let pid = next_pid.fetch_add(1, Ordering::Relaxed) as u32;
+                                    let mut sess = Session::new(db, pid, front);
+                                    let _ = sess.run(Conn::Unix(s));
+                                })
+                                .ok();
+                        }
+                        Err(e) => eprintln!("! unix accept error: {}", e),
+                    }
+                }
+            })
+            .ok();
+    }
     for stream in listener.incoming() {
         match stream {
             Ok(s) => {
@@ -341,6 +351,7 @@ struct Txn {
 pub enum Conn {
     Plain(std::net::TcpStream),
     Tls(Box<rustls::StreamOwned<rustls::ServerConnection, std::net::TcpStream>>),
+    Unix(std::os::unix::net::UnixStream),
 }
 
 impl std::io::Read for Conn {
@@ -348,6 +359,7 @@ impl std::io::Read for Conn {
         match self {
             Conn::Plain(s) => s.read(buf),
             Conn::Tls(s) => s.read(buf),
+            Conn::Unix(s) => s.read(buf),
         }
     }
 }
@@ -357,12 +369,14 @@ impl std::io::Write for Conn {
         match self {
             Conn::Plain(s) => s.write(buf),
             Conn::Tls(s) => s.write(buf),
+            Conn::Unix(s) => s.write(buf),
         }
     }
     fn flush(&mut self) -> std::io::Result<()> {
         match self {
             Conn::Plain(s) => s.flush(),
             Conn::Tls(s) => s.flush(),
+            Conn::Unix(s) => s.flush(),
         }
     }
 }
@@ -533,10 +547,17 @@ impl Session {
     fn run(&mut self, mut stream: Conn) -> std::io::Result<()> {
         if let Conn::Plain(s) = &stream {
             s.set_nodelay(true)?;
-        }
+        } // (Unix sockets have no Nagle to disable)
         loop {
             match wire::read_startup(&mut stream)? {
-                wire::Startup::SslRequest => match &self.cfg.tls {
+                wire::Startup::SslRequest => {
+                    // TLS is a TCP-only feature: on a Unix socket (exactly
+                    // like PostgreSQL) we always decline with 'N'; libpq
+                    // sends SSLRequest there under sslmode=prefer and
+                    // continues in the clear when it sees 'N'.
+                    let offered: Option<&Arc<rustls::ServerConfig>> =
+                        if matches!(stream, Conn::Unix(_)) { None } else { self.cfg.tls.as_ref() };
+                    match offered {
                     Some(tls) => {
                         // accept the upgrade: 'S', then complete the handshake
                         if let Conn::Plain(mut tcp) = stream {
@@ -562,6 +583,7 @@ impl Session {
                             return Ok(());
                         }
                         stream.write_all(b"N")?;
+                    }
                     }
                 },
                 wire::Startup::GssencRequest => {
@@ -828,18 +850,18 @@ impl Session {
             let hdr: Vec<engine::Value> =
                 cols.iter().map(|(n, _)| engine::Value::Text(n.clone())).collect();
             let line = if opts.csv {
-                crate::copy::encode_csv_row(&hdr, opts.delimiter, opts.quote)
+                copy::encode_csv_row(&hdr, opts.delimiter, opts.quote)
             } else {
-                crate::copy::encode_text_row(&hdr, opts.delimiter, &opts.null)
+                copy::encode_text_row(&hdr, opts.delimiter, &opts.null)
             };
             wire::msg(out, b'd', line.as_bytes());
         }
         let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
         for r in &rows {
             let line = if opts.csv {
-                crate::copy::encode_csv_row(r, opts.delimiter, opts.quote)
+                copy::encode_csv_row(r, opts.delimiter, opts.quote)
             } else {
-                crate::copy::encode_text_row(r, opts.delimiter, &opts.null)
+                copy::encode_text_row(r, opts.delimiter, &opts.null)
             };
             buf.extend_from_slice(line.as_bytes());
             if buf.len() >= 64 * 1024 {
@@ -1419,10 +1441,23 @@ fn stmt_max_param(stmt: &sql::Stmt) -> i32 {
                 e_of(e, &mut m);
             }
         }
-        Stmt::Insert { rows, .. } => {
+        Stmt::Insert { rows, query, conflict, .. } => {
             for row in rows {
                 for e in row {
                     e_of(e, &mut m);
+                }
+            }
+            if let Some(q) = query {
+                m = m.max(stmt_max_param(q));
+            }
+            if let Some(oc) = conflict {
+                if let sql::ConflictAction::Update { sets, guard } = &oc.action {
+                    for (_, e) in sets {
+                        e_of(e, &mut m);
+                    }
+                    if let Some(g) = guard {
+                        e_of(g, &mut m);
+                    }
                 }
             }
         }

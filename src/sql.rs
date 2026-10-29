@@ -7,7 +7,7 @@ use crate::engine::{AggKind, Ty, Value};
 
 // ------------------------------------------------------------------- lexer --
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum Tok {
     Ident(String),  // case-folded to lowercase
     Num(String),
@@ -263,6 +263,18 @@ pub enum Expr {
     IsNull(Box<Expr>, bool), // IS [NOT] NULL
     Like(Box<Expr>, Box<Expr>, bool),
     InList(Box<Expr>, Vec<Expr>, bool),
+    /// IN (SELECT ...): the subquery is evaluated eagerly at rewrite time
+    /// (uncorrelated only) and lowered to an InList of literals
+    InSub(Box<Expr>, Box<SelectStmt>, bool),
+    /// Window function call: fn(args) OVER (spec). Replaced with
+    /// Col("__win_k") before evaluation; the values are computed by the
+    /// window pass in the reference executor.
+    Win {
+        kind: WinKind,
+        args: Vec<Expr>,
+        spec: Box<WindowSpec>,
+        filter: Option<Box<Expr>>, // FILTER (WHERE ...) on a window aggregate
+    },
     Between(Box<Expr>, Box<Expr>, Box<Expr>, bool),
     Case {
         operand: Option<Box<Expr>>,
@@ -271,7 +283,7 @@ pub enum Expr {
     },
     Cast(Box<Expr>, Ty),
     Func(String, Vec<Expr>),
-    Agg(AggKind, Box<Expr>, bool), // (kind, arg, distinct)
+    Agg(AggKind, Box<Expr>, bool, Option<Box<Expr>>), // (kind, arg, distinct, FILTER)
     AggRef(usize),                 // filled during aggregate evaluation
     Subquery(Box<SelectStmt>),     // scalar subquery (evaluated eagerly)
 }
@@ -284,6 +296,16 @@ impl Expr {
             Expr::Neg(a) | Expr::Not(a) | Expr::IsNull(a, _) | Expr::Cast(a, _) => a.has_agg(),
             Expr::Like(a, b, _) | Expr::Between(a, b, _, _) => a.has_agg() || b.has_agg(),
             Expr::InList(a, l, _) => a.has_agg() || l.iter().any(|e| e.has_agg()),
+            Expr::InSub(a, _, _) => a.has_agg(),
+            Expr::Win { kind, args, spec, filter } => {
+                // an aggregate inside OVER makes the whole query an
+                // aggregate query (PG), e.g. rank() OVER (ORDER BY sum(x))
+                matches!(kind, WinKind::Agg(_))
+                    || args.iter().any(|a| a.has_agg())
+                    || spec.partition_by.iter().any(|a| a.has_agg())
+                    || spec.order_by.iter().any(|(e, _, _)| e.has_agg())
+                    || filter.as_ref().is_some_and(|e| e.has_agg())
+            }
             Expr::Bin(a, _, b) => a.has_agg() || b.has_agg(),
             Expr::Case {
                 operand,
@@ -310,6 +332,15 @@ impl Expr {
             Expr::InList(a, l, _) => {
                 a.max_param().max(l.iter().map(|e| e.max_param()).max().unwrap_or(0))
             }
+            // (like Subquery: params inside subqueries are not counted)
+            Expr::InSub(a, _, _) => a.max_param(),
+            Expr::Win { args, spec, .. } => args
+                .iter()
+                .map(|a| a.max_param())
+                .max()
+                .unwrap_or(0)
+                .max(spec.partition_by.iter().map(|a| a.max_param()).max().unwrap_or(0))
+                .max(spec.order_by.iter().map(|(e, _, _)| e.max_param()).max().unwrap_or(0)),
             Expr::Bin(a, _, b) => a.max_param().max(b.max_param()),
             Expr::Case {
                 operand,
@@ -326,7 +357,7 @@ impl Expr {
                 m
             }
             Expr::Func(_, args) => args.iter().map(|a| a.max_param()).max().unwrap_or(0),
-            Expr::Agg(_, a, _) => a.max_param(),
+            Expr::Agg(_, a, _, f) => a.max_param().max(f.as_ref().map_or(0, |e| e.max_param())),
             _ => 0,
         }
     }
@@ -346,6 +377,20 @@ impl Expr {
             Expr::InList(a, l, _) => {
                 a.collect_cols(out);
                 l.iter().for_each(|e| e.collect_cols(out));
+            }
+            Expr::InSub(a, _, _) => {
+                a.collect_cols(out);
+            }
+            Expr::Win { args, spec, .. } => {
+                for a in args {
+                    a.collect_cols(out);
+                }
+                for a in &spec.partition_by {
+                    a.collect_cols(out);
+                }
+                for (e, _, _) in &spec.order_by {
+                    e.collect_cols(out);
+                }
             }
             Expr::Bin(a, _, b) => {
                 a.collect_cols(out);
@@ -388,7 +433,8 @@ pub enum AsOf {
     Lsn(u64),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
+
 pub struct TableRef {
     pub name: String,
     pub alias: Option<String>,
@@ -399,6 +445,22 @@ pub struct TableRef {
     pub func_args: Option<Vec<Expr>>,
     /// column alias list after a table alias: FROM s(a, b) / g(x)
     pub col_aliases: Vec<String>,
+    /// derived table in FROM position: FROM (SELECT ...) [AS] x [(a, b)].
+    /// None everywhere else.
+    pub subquery: Option<Box<Stmt>>,
+}
+
+impl PartialEq for TableRef {
+    fn eq(&self, other: &Self) -> bool {
+        // subquery is intentionally not compared: the only PartialEq use
+        // in the engine is the GROUP BY coverage check, and expression
+        // trees never embed FROM items
+        self.name == other.name
+            && self.alias == other.alias
+            && self.as_of == other.as_of
+            && self.func_args == other.func_args
+            && self.col_aliases == other.col_aliases
+    }
 }
 
 impl TableRef {
@@ -424,6 +486,8 @@ impl TableRef {
 pub enum JoinKind {
     Inner,
     Left,
+    Right,
+    Full,
     Cross,
 }
 
@@ -432,6 +496,76 @@ pub struct Join {
     pub kind: JoinKind,
     pub table: TableRef,
     pub on: Option<Expr>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CteDef {
+    pub name: String,
+    pub col_aliases: Vec<String>,
+    pub body: Box<Stmt>,
+}
+
+/// ON CONFLICT clause of INSERT.
+#[derive(Clone, Debug)]
+pub struct OnConflict {
+    /// conflict target column (puddle indexes are single-column, so a
+    /// target list must have exactly one entry; empty = "any index")
+    pub target: Vec<String>,
+    pub action: ConflictAction,
+}
+
+#[derive(Clone, Debug)]
+pub enum ConflictAction {
+    Nothing,
+    Update {
+        sets: Vec<(String, Expr)>,
+        guard: Option<Expr>, // optional WHERE on the DO UPDATE
+    },
+}
+
+/// Window function kinds (aggregates over frames reuse AggKind).
+#[derive(Clone, Debug, PartialEq)]
+pub enum WinKind {
+    RowNumber,
+    Rank,
+    DenseRank,
+    PercentRank,
+    CumeDist,
+    Ntile,
+    Lag,
+    Lead,
+    FirstValue,
+    LastValue,
+    NthValue,
+    Agg(AggKind),
+}
+
+/// OVER ( [PARTITION BY ...] [ORDER BY ...] [frame] )
+#[derive(Clone, Debug, PartialEq)]
+pub struct WindowSpec {
+    /// OVER w / OVER (w ...): the referenced WINDOW-clause name, resolved
+    /// (merged) before execution; None for inline specs.
+    pub name: Option<String>,
+    pub partition_by: Vec<Expr>,
+    pub order_by: Vec<(Expr, bool, bool)>, // (key, desc, nulls_first)
+    pub frame: Option<Frame>,
+}
+
+/// The default frame is RANGE UNBOUNDED PRECEDING .. CURRENT ROW (PG).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Frame {
+    pub rows: bool, // true = ROWS mode; false = RANGE mode
+    pub start: FrameBound,
+    pub end: FrameBound,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum FrameBound {
+    UnboundedPreceding,
+    Preceding(i64),
+    CurrentRow,
+    Following(i64),
+    UnboundedFollowing,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -443,6 +577,8 @@ pub struct FromItem {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SelectStmt {
     pub distinct: bool,
+    /// WINDOW w AS (spec), ... clause (names usable in OVER)
+    pub windows: Vec<(String, WindowSpec)>,
     pub items: Vec<SelectItem>,
     pub from_items: Vec<FromItem>,
     pub where_: Option<Expr>,
@@ -453,18 +589,29 @@ pub struct SelectStmt {
     pub offset: Option<Expr>,
 }
 
+/// ORDER BY keys + LIMIT/OFFSET of a compound statement.
+pub type OrderLimitTail = (Vec<(Expr, bool, bool)>, Option<Expr>, Option<Expr>);
+
 #[derive(Clone, Debug)]
 pub struct ColumnDef {
     pub name: String,
     pub ty: Ty,
     pub not_null: bool,
+    /// PRIMARY KEY: implies not-null + unique (implicit <t>_pkey index)
+    pub primary_key: bool,
+    /// UNIQUE constraint (implicit <t>_<col>_key index)
+    pub unique: bool,
+    /// DEFAULT <expr> for INSERTs that omit the column
+    pub default: Option<Expr>,
+    /// CHECK (<expr>) evaluated on every written row
+    pub check: Option<Expr>,
 }
 
 #[derive(Clone, Debug)]
 pub enum Stmt {
     Select(SelectStmt),
     Union {
-        arms: Vec<SelectStmt>,
+        arms: Vec<Stmt>,
         all: bool,                                 // UNION ALL
         order_by: Vec<(Expr, bool, bool)>,         // applied to the combined set
         limit: Option<Expr>,
@@ -482,7 +629,9 @@ pub enum Stmt {
     Insert {
         table: TableRef,
         cols: Vec<String>, // explicit column list (empty = all, in order)
-        rows: Vec<Vec<Expr>>,
+        rows: Vec<Vec<Expr>>, // VALUES rows (empty when query is set)
+        query: Option<Box<Stmt>>, // INSERT INTO ... SELECT ...
+        conflict: Option<OnConflict>, // ON CONFLICT [()] DO ...
         returning: Vec<SelectItem>,
     },
     Update {
@@ -496,6 +645,23 @@ pub enum Stmt {
         where_: Option<Expr>,
         returning: Vec<SelectItem>,
     },
+    /// WITH name [(cols)] AS (query) [, ...] attached to a
+    /// SELECT / INSERT / UPDATE / DELETE body. Bodies are materialized
+    /// once and shared by every reference (PG MATERIALIZED semantics).
+    With {
+        recursive: bool,
+        ctes: Vec<CteDef>,
+        body: Box<Stmt>,
+    },
+    /// VALUES (1,'a'),(2,'b') as a statement or subquery body. Columns
+    /// are named column1..columnN (PG). order/limit apply at statement
+    /// level only.
+    Values {
+        rows: Vec<Vec<Expr>>,
+        order_by: Vec<(Expr, bool, bool)>,
+        limit: Option<Expr>,
+        offset: Option<Expr>,
+    },
     Begin,
     Commit,
     Rollback,
@@ -507,6 +673,8 @@ pub enum Stmt {
         table: String,
         method: IdxMethod,
         col: String,
+        /// CREATE UNIQUE INDEX (v2.2): the index enforces uniqueness
+        unique: bool,
     },
     DropIndex {
         name: String,
@@ -581,14 +749,14 @@ const MAX_EXPR_DEPTH: usize = 128;
 const RESERVED_AFTER_EXPR: &[&str] = &[
     "from", "where", "as", "and", "or", "not", "is", "null", "true", "false", "order", "by",
     "limit", "offset", "group", "having", "asc", "desc", "case", "when", "then", "else", "end",
-    "like", "in", "between", "on", "join", "inner", "left", "right", "outer", "cross", "union",
-    "returning", "set", "values", "into", "distinct",
+    "like", "in", "between", "on", "join", "inner", "left", "right", "full", "outer", "cross",
+    "union", "returning", "set", "values", "into", "distinct", "over", "filter", "window",
 ];
 
 const RESERVED_AFTER_TABLE: &[&str] = &[
-    "on", "join", "inner", "left", "right", "outer", "cross", "where", "group", "order",
+    "on", "join", "inner", "left", "right", "full", "outer", "cross", "where", "group", "order",
     "limit", "having", "union", "returning", "set", "as", "by", "offset", "values",
-    "from", "to",
+    "from", "to", "select", "with", "conflict", "window", "over", "filter", "using",
 ];
 
 impl Parser {
@@ -671,12 +839,35 @@ impl Parser {
     }
 
     fn statement(&mut self) -> Result<Stmt, String> {
+        if self.kw("with") {
+            return self.with_stmt();
+        }
         if self.kw("select") {
             let first = self.select_stmt()?;
             if self.peek_kw("union") {
-                return self.union_rest(first);
+                return self.union_rest(Stmt::Select(first));
             }
             return Ok(Stmt::Select(first));
+        }
+        if self.kw("values") {
+            let rows = self.values_rows()?;
+            if self.peek_kw("union") {
+                // compound: ORDER BY / LIMIT belong to the compound parser
+                let v = Stmt::Values {
+                    rows,
+                    order_by: Vec::new(),
+                    limit: None,
+                    offset: None,
+                };
+                return self.union_rest(v);
+            }
+            let (order_by, limit, offset) = self.order_limit_tail()?;
+            return Ok(Stmt::Values {
+                rows,
+                order_by,
+                limit,
+                offset,
+            });
         }
         if self.kw("copy") {
             return self.copy_stmt();
@@ -698,27 +889,114 @@ impl Parser {
                 if !self.op("(") {
                     return Err("expected ( after table name".into());
                 }
-                let mut cols = Vec::new();
+                let mut cols: Vec<ColumnDef> = Vec::new();
+                // table-level constraints attach to columns (single-column
+                // forms); parsed inside the loop so they can follow a comma
+                macro_rules! table_level {
+                    () => {
+                        if self.kw("primary") {
+                            if !self.kw("key") || !self.op("(") {
+                                return Err("expected KEY ( after table-level PRIMARY".into());
+                            }
+                            let c = self.ident("primary key column")?;
+                            if !self.op(")") {
+                                return Err("expected ) after PRIMARY KEY column".into());
+                            }
+                            let cd = cols
+                                .iter_mut()
+                                .find(|c2| c2.name == c)
+                                .ok_or_else(|| format!("PRIMARY KEY column \"{}\" not in table", c))?;
+                            cd.primary_key = true;
+                            cd.not_null = true;
+                            true
+                        } else if self.kw("unique") {
+                            if !self.op("(") {
+                                return Err("expected ( after table-level UNIQUE".into());
+                            }
+                            let c = self.ident("unique column")?;
+                            if !self.op(")") {
+                                return Err("expected ) after UNIQUE column".into());
+                            }
+                            let cd = cols
+                                .iter_mut()
+                                .find(|c2| c2.name == c)
+                                .ok_or_else(|| format!("UNIQUE column \"{}\" not in table", c))?;
+                            cd.unique = true;
+                            true
+                        } else if self.kw("check") {
+                            if !self.op("(") {
+                                return Err("expected ( after table-level CHECK".into());
+                            }
+                            let e = self.expr()?;
+                            if !self.op(")") {
+                                return Err("expected ) after CHECK expression".into());
+                            }
+                            match cols.iter_mut().find(|c2| c2.check.is_none()) {
+                                Some(cd) => cd.check = Some(e),
+                                None => {
+                                    return Err(
+                                        "multiple table-level CHECK constraints not supported"
+                                            .into(),
+                                    )
+                                }
+                            }
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                }
                 loop {
+                    // table-level constraint: PRIMARY KEY (c) / UNIQUE (c) /
+                    // CHECK (expr) — only after at least one column
+                    if !cols.is_empty() && table_level!() {
+                        if self.op(",") {
+                            continue;
+                        }
+                        break;
+                    }
                     let cname = self.ident("column name")?;
                     let ty = self.parse_type()?;
-                    let mut not_null = false;
+                    let mut cd = ColumnDef {
+                        name: cname,
+                        ty,
+                        not_null: false,
+                        primary_key: false,
+                        unique: false,
+                        default: None,
+                        check: None,
+                    };
+                    // column constraints, any order
                     loop {
                         if self.kw("not") {
                             if !self.kw("null") {
                                 return Err("expected NULL after NOT".into());
                             }
-                            not_null = true;
+                            cd.not_null = true;
                         } else if self.kw("null") {
+                        } else if self.kw("primary") {
+                            if !self.kw("key") {
+                                return Err("expected KEY after PRIMARY".into());
+                            }
+                            cd.primary_key = true;
+                            cd.not_null = true;
+                        } else if self.kw("unique") {
+                            cd.unique = true;
+                        } else if self.kw("default") {
+                            cd.default = Some(self.expr()?);
+                        } else if self.kw("check") {
+                            if !self.op("(") {
+                                return Err("expected ( after CHECK".into());
+                            }
+                            cd.check = Some(self.expr()?);
+                            if !self.op(")") {
+                                return Err("expected ) after CHECK expression".into());
+                            }
                         } else {
                             break;
                         }
                     }
-                    cols.push(ColumnDef {
-                        name: cname,
-                        ty,
-                        not_null,
-                    });
+                    cols.push(cd);
                     if self.op(",") {
                         continue;
                     }
@@ -733,6 +1011,7 @@ impl Parser {
                     cols,
                 });
             }
+            let unique = self.kw("unique");
             if self.kw("index") {
                 let if_not_exists = if self.kw("if") {
                     if !self.kw("not") {
@@ -782,6 +1061,7 @@ impl Parser {
                     table,
                     method,
                     col,
+                    unique,
                 });
             }
             if self.kw("snapshot") {
@@ -855,36 +1135,79 @@ impl Parser {
                     return Err("expected ) after column list".into());
                 }
             }
-            if !self.kw("values") {
-                return Err("expected VALUES in INSERT".into());
+            // source: VALUES rows or a full query (SELECT / WITH / parens)
+            let mut rows: Vec<Vec<Expr>> = Vec::new();
+            let mut query: Option<Box<Stmt>> = None;
+            if self.kw("values") {
+                rows = self.values_rows()?;
+            } else if self.peek_kw("select")
+                || self.peek_kw("with")
+                || matches!(self.peek(), Tok::Op("("))
+            {
+                let q = self.query_body()?;
+                query = Some(Box::new(q));
+            } else {
+                return Err("expected VALUES or SELECT in INSERT".into());
             }
-            let mut rows = Vec::new();
-            loop {
-                if !self.op("(") {
-                    return Err("expected ( to start VALUES row".into());
+            // ON CONFLICT [(col)] DO NOTHING | DO UPDATE SET ...
+            let mut conflict: Option<OnConflict> = None;
+            if self.kw("on") {
+                if !self.kw("conflict") {
+                    return Err("expected CONFLICT after ON".into());
                 }
-                let mut row = Vec::new();
-                loop {
-                    row.push(self.expr()?);
-                    if self.op(",") {
-                        continue;
+                let mut target = Vec::new();
+                if self.op("(") {
+                    loop {
+                        target.push(self.ident("conflict target column")?);
+                        if self.op(",") {
+                            continue;
+                        }
+                        if self.op(")") {
+                            break;
+                        }
+                        return Err("expected , or ) after conflict target".into());
                     }
-                    break;
                 }
-                if !self.op(")") {
-                    return Err("expected ) to end VALUES row".into());
+                if !self.kw("do") {
+                    return Err("expected DO after ON CONFLICT target".into());
                 }
-                rows.push(row);
-                if self.op(",") {
-                    continue;
-                }
-                break;
+                let action = if self.kw("nothing") {
+                    ConflictAction::Nothing
+                } else if self.kw("update") {
+                    if !self.kw("set") {
+                        return Err("expected SET after DO UPDATE".into());
+                    }
+                    let mut sets = Vec::new();
+                    loop {
+                        let col = self.ident("column name")?;
+                        if !self.op("=") {
+                            return Err("expected = in SET".into());
+                        }
+                        let e = self.expr()?;
+                        sets.push((col, e));
+                        if self.op(",") {
+                            continue;
+                        }
+                        break;
+                    }
+                    let guard = if self.kw("where") {
+                        Some(self.expr()?)
+                    } else {
+                        None
+                    };
+                    ConflictAction::Update { sets, guard }
+                } else {
+                    return Err("expected NOTHING or UPDATE after DO".into());
+                };
+                conflict = Some(OnConflict { target, action });
             }
             let returning = self.parse_returning()?;
             return Ok(Stmt::Insert {
                 table,
                 cols,
                 rows,
+                query,
+                conflict,
                 returning,
             });
         }
@@ -1097,7 +1420,20 @@ impl Parser {
                 "ALTER TABLE ... ADD COLUMN: only nullable columns (no NOT NULL/DEFAULT)".into(),
             );
         }
-        Ok(Stmt::AlterAddColumn { table, if_exists, if_not_exists, col: ColumnDef { name, ty, not_null } })
+        Ok(Stmt::AlterAddColumn {
+            table,
+            if_exists,
+            if_not_exists,
+            col: ColumnDef {
+                name,
+                ty,
+                not_null,
+                primary_key: false,
+                unique: false,
+                default: None,
+                check: None,
+            },
+        })
     }
 
     fn copy_stmt(&mut self) -> Result<Stmt, String> {
@@ -1260,6 +1596,53 @@ impl Parser {
     }
 
     fn table_ref(&mut self, from_position: bool) -> Result<TableRef, String> {
+        // derived table: FROM (SELECT ...) [AS] x [(a, b)] — only legal in
+        // FROM position (a paren after a DML/COPY table name is a column
+        // list, never a subquery)
+        if from_position && matches!(self.peek(), Tok::Op("(")) {
+            self.next(); // (
+            let sq = self.subquery_body()?;
+            if !self.op(")") {
+                return Err("expected ) after derived table subquery".into());
+            }
+            // alias: AS x / bare x, then an optional column alias list
+            let alias = if self.peek_kw("as") {
+                self.next();
+                Some(self.ident("subquery alias")?)
+            } else if matches!(
+                self.peek(),
+                Tok::Ident(ref s) if !RESERVED_AFTER_TABLE.contains(&s.as_str())
+            ) {
+                match self.next() {
+                    Tok::Ident(v) => Some(v),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let mut col_aliases = Vec::new();
+            if self.op("(") {
+                loop {
+                    col_aliases.push(self.ident("column alias")?);
+                    if self.op(",") {
+                        continue;
+                    }
+                    if self.op(")") {
+                        break;
+                    }
+                    return Err("expected , or ) in column alias list".into());
+                }
+            }
+            let name = alias.clone().unwrap_or_default();
+            return Ok(TableRef {
+                name,
+                alias,
+                as_of: None,
+                func_args: None,
+                col_aliases,
+                subquery: Some(Box::new(sq)),
+            });
+        }
         let mut name = self.ident("table name")?;
         if self.op(".") {
             // schema-qualified: keep the full name for catalog routing,
@@ -1364,22 +1747,254 @@ impl Parser {
             as_of,
             func_args,
             col_aliases,
+            subquery: None,
         })
+    }
+
+    /// WITH name [(cols)] AS [NOT] MATERIALIZED (query) [, ...] <stmt>
+    /// FILTER (WHERE expr) after an aggregate call's closing paren.
+    fn filter_clause(&mut self) -> Result<Option<Expr>, String> {
+        if !self.kw("filter") {
+            return Ok(None);
+        }
+        if !self.op("(") {
+            return Err("expected ( after FILTER".into());
+        }
+        if !self.kw("where") {
+            return Err("expected WHERE in FILTER clause".into());
+        }
+        let e = self.expr()?;
+        if !self.op(")") {
+            return Err("expected ) after FILTER clause".into());
+        }
+        Ok(Some(e))
+    }
+
+    /// (expr, ...), (expr, ...) rows after a VALUES keyword.
+    fn values_rows(&mut self) -> Result<Vec<Vec<Expr>>, String> {
+        let mut rows = Vec::new();
+        loop {
+            if !self.op("(") {
+                return Err("expected ( to start VALUES row".into());
+            }
+            let mut row = Vec::new();
+            loop {
+                row.push(self.expr()?);
+                if self.op(",") {
+                    continue;
+                }
+                break;
+            }
+            if !self.op(")") {
+                return Err("expected ) to end VALUES row".into());
+            }
+            rows.push(row);
+            if self.op(",") {
+                continue;
+            }
+            break;
+        }
+        Ok(rows)
+    }
+
+    /// Trailing ORDER BY / LIMIT / OFFSET of a compound statement
+    /// (shared by UNION and VALUES).
+    fn order_limit_tail(&mut self) -> Result<OrderLimitTail, String> {
+        let mut order_by = Vec::new();
+        while self.kw("order") {
+            if !self.kw("by") {
+                return Err("expected BY after ORDER".into());
+            }
+            loop {
+                let e = self.expr()?;
+                let mut desc = false;
+                let mut nulls_last = false;
+                if self.kw("asc") {
+                } else if self.kw("desc") {
+                    desc = true;
+                }
+                if self.kw("nulls") {
+                    if self.kw("first") {
+                        nulls_last = false;
+                    } else if self.kw("last") {
+                        nulls_last = true;
+                    } else {
+                        return Err("expected FIRST or LAST after NULLS".into());
+                    }
+                }
+                order_by.push((e, desc, nulls_last));
+                if self.op(",") {
+                    continue;
+                }
+                break;
+            }
+        }
+        let limit = if self.kw("limit") {
+            Some(self.expr()?)
+        } else {
+            None
+        };
+        let offset = if self.kw("offset") {
+            Some(self.expr()?)
+        } else {
+            None
+        };
+        Ok((order_by, limit, offset))
+    }
+
+    fn with_stmt(&mut self) -> Result<Stmt, String> {
+        let recursive = self.kw("recursive");
+        let mut ctes = Vec::new();
+        loop {
+            let name = self.ident("CTE name")?;
+            let mut col_aliases = Vec::new();
+            if self.op("(") {
+                loop {
+                    col_aliases.push(self.ident("column alias")?);
+                    if self.op(",") {
+                        continue;
+                    }
+                    if self.op(")") {
+                        break;
+                    }
+                    return Err("expected , or ) in CTE column alias list".into());
+                }
+            }
+            if !self.kw("as") {
+                return Err("expected AS after CTE name".into());
+            }
+            // MATERIALIZED / NOT MATERIALIZED: accepted; puddle always
+            // materializes once (PG MATERIALIZED semantics)
+            let _ = self.kw("not");
+            let _ = self.kw("materialized");
+            if !self.op("(") {
+                return Err("expected ( to start CTE body".into());
+            }
+            let body = self.query_body()?;
+            if !self.op(")") {
+                return Err("expected ) after CTE body".into());
+            }
+            ctes.push(CteDef {
+                name,
+                col_aliases,
+                body: Box::new(body),
+            });
+            if self.op(",") {
+                continue;
+            }
+            break;
+        }
+        let body = self.statement()?;
+        match body {
+            Stmt::Select(_)
+            | Stmt::Union { .. }
+            | Stmt::Insert { .. }
+            | Stmt::Update { .. }
+            | Stmt::Delete { .. } => Ok(Stmt::With {
+                recursive,
+                ctes,
+                body: Box::new(body),
+            }),
+            _ => Err("WITH clause applies to SELECT, INSERT, UPDATE or DELETE".into()),
+        }
+    }
+
+    /// A query inside parens: SELECT/UNION chain, WITH query, or another
+    /// paren layer.
+    fn query_body(&mut self) -> Result<Stmt, String> {
+        if self.op("(") {
+            let inner = self.query_body()?;
+            if !self.op(")") {
+                return Err("expected ) after subquery".into());
+            }
+            return Ok(inner);
+        }
+        if self.kw("with") {
+            return self.with_stmt();
+        }
+        if self.kw("values") {
+            let rows = self.values_rows()?;
+            let v = Stmt::Values {
+                rows,
+                order_by: Vec::new(),
+                limit: None,
+                offset: None,
+            };
+            if self.peek_kw("union") {
+                return self.union_rest(v);
+            }
+            return Ok(v);
+        }
+        if !self.kw("select") {
+            return Err("expected SELECT in subquery".into());
+        }
+        let first = self.select_stmt()?;
+        if self.peek_kw("union") {
+            return self.union_rest(Stmt::Select(first));
+        }
+        Ok(Stmt::Select(first))
+    }
+
+    /// Body of a derived table / CTE: a full SELECT, UNION chain, or
+    /// another parenthesized query. The caller consumed the opening ( and
+    /// consumes the matching ).
+    fn subquery_body(&mut self) -> Result<Stmt, String> {
+        if self.op("(") {
+            let inner = self.subquery_body()?;
+            if !self.op(")") {
+                return Err("expected ) after subquery".into());
+            }
+            return Ok(inner);
+        }
+        if self.kw("with") {
+            return self.with_stmt();
+        }
+        if self.kw("values") {
+            let rows = self.values_rows()?;
+            let v = Stmt::Values {
+                rows,
+                order_by: Vec::new(),
+                limit: None,
+                offset: None,
+            };
+            if self.peek_kw("union") {
+                return self.union_rest(v);
+            }
+            return Ok(v);
+        }
+        if !self.kw("select") {
+            return Err("expected SELECT in subquery".into());
+        }
+        let first = self.select_stmt()?;
+        if self.peek_kw("union") {
+            return self.union_rest(Stmt::Select(first));
+        }
+        Ok(Stmt::Select(first))
     }
 
     /// UNION [ALL] chain after the first arm (ORDER BY/LIMIT/OFFSET belong
     /// to the whole compound, per SQL).
-    fn union_rest(&mut self, first: SelectStmt) -> Result<Stmt, String> {
+    fn union_rest(&mut self, first: Stmt) -> Result<Stmt, String> {
         let mut arms = vec![first];
         let mut all = false;
         while self.kw("union") {
             if self.kw("all") {
                 all = true; // any ALL in the chain keeps duplicates for that arm
             }
+            if self.kw("values") {
+                // VALUES arm: rows belong to the compound, no own ORDER BY
+                arms.push(Stmt::Values {
+                    rows: self.values_rows()?,
+                    order_by: Vec::new(),
+                    limit: None,
+                    offset: None,
+                });
+                continue;
+            }
             if !self.kw("select") {
                 return Err("expected SELECT after UNION".into());
             }
-            arms.push(self.select_stmt()?);
+            arms.push(Stmt::Select(self.select_stmt()?));
         }
         let mut order_by = Vec::new();
         while self.kw("order") {
@@ -1426,6 +2041,24 @@ impl Parser {
         } else {
             None
         };
+        // PG grammar: a trailing ORDER BY / LIMIT / OFFSET belongs to the
+        // compound, but select_stmt already attached it to the final arm
+        // (the arm parser cannot know a UNION follows). Lift it up.
+        let (mut order_by, mut limit, mut offset) = (order_by, limit, offset);
+        if let Some(Stmt::Select(last)) = arms.last_mut() {
+            if !last.order_by.is_empty() {
+                let lifted = std::mem::take(&mut last.order_by);
+                let extra = std::mem::take(&mut order_by);
+                order_by = lifted;
+                order_by.extend(extra);
+            }
+            if limit.is_none() {
+                limit = last.limit.take();
+            }
+            if offset.is_none() {
+                offset = last.offset.take();
+            }
+        }
         Ok(Stmt::Union {
             arms,
             all,
@@ -1435,7 +2068,189 @@ impl Parser {
         })
     }
 
+    /// Parses OVER ( ... ) after a function call.
+    fn over_clause(&mut self) -> Result<WindowSpec, String> {
+        // an identifier here is a window NAME unless it starts a spec body
+        let is_name = |n: &str| {
+            !RESERVED_AFTER_EXPR.contains(&n)
+                && !matches!(n, "partition" | "order" | "rows" | "range")
+        };
+        // OVER w  — bare reference to a WINDOW-clause name
+        if let Tok::Ident(ref n) = self.peek() {
+            if is_name(n) {
+                let name = match self.next() {
+                    Tok::Ident(v) => v,
+                    _ => return Err("expected window name after OVER".into()),
+                };
+                return Ok(WindowSpec {
+                    name: Some(name),
+                    partition_by: Vec::new(),
+                    order_by: Vec::new(),
+                    frame: None,
+                });
+            }
+        }
+        if !self.op("(") {
+            return Err("expected ( or a window name after OVER".into());
+        }
+        // OVER ( [w] [ORDER BY ...] [frame] ) — w = base window name to
+        // inherit from (PG: PARTITION BY cannot be re-specified)
+        if let Tok::Ident(ref n) = self.peek() {
+            if is_name(n) {
+                let name = match self.next() {
+                    Tok::Ident(v) => v,
+                    _ => return Err("expected window name".into()),
+                };
+                // a following PARTITION BY is parsed into the spec; the
+                // resolver rejects it with PG's 42P10
+                let mut spec = self.window_spec_body()?;
+                if !self.op(")") {
+                    return Err("expected ) after window specification".into());
+                }
+                spec.name = Some(name);
+                return Ok(spec);
+            }
+        }
+        let spec = self.window_spec_body()?;
+        if !self.op(")") {
+            return Err("expected ) after window specification".into());
+        }
+        Ok(spec)
+    }
+
+    /// The inside of a window specification: [PARTITION BY ...]
+    /// [ORDER BY ...] [frame]. Caller handles the parentheses.
+    fn window_spec_body(&mut self) -> Result<WindowSpec, String> {
+        let mut spec = WindowSpec {
+            name: None,
+            partition_by: Vec::new(),
+            order_by: Vec::new(),
+            frame: None,
+        };
+        if self.kw("partition") {
+            if !self.kw("by") {
+                return Err("expected BY after PARTITION".into());
+            }
+            loop {
+                spec.partition_by.push(self.expr()?);
+                if self.op(",") {
+                    continue;
+                }
+                break;
+            }
+        }
+        if self.kw("order") {
+            if !self.kw("by") {
+                return Err("expected BY after ORDER".into());
+            }
+            loop {
+                let e = self.expr()?;
+                let desc = if self.kw("desc") {
+                    true
+                } else {
+                    self.kw("asc");
+                    false
+                };
+                let nulls_first = if self.kw("nulls") {
+                    if self.kw("first") {
+                        true
+                    } else if self.kw("last") {
+                        false
+                    } else {
+                        return Err("expected FIRST or LAST after NULLS".into());
+                    }
+                } else {
+                    desc
+                };
+                spec.order_by.push((e, desc, nulls_first));
+                if self.op(",") {
+                    continue;
+                }
+                break;
+            }
+        }
+        // frame: [ROWS|RANGE] BETWEEN bound AND bound, or the single-bound
+        // form [ROWS|RANGE] bound (end = CURRENT ROW). RANGE is only
+        // supported with UNBOUNDED/CURRENT bounds (PG's default frame).
+        let frame_mode = if self.peek_kw("rows") {
+            self.next();
+            Some(true)
+        } else if self.peek_kw("range") {
+            self.next();
+            Some(false)
+        } else {
+            None
+        };
+        if let Some(rows_mode) = frame_mode {
+            let between = self.kw("between");
+            let start = self.frame_bound(rows_mode)?;
+            let end = if between {
+                if !self.kw("and") {
+                    return Err("expected AND in frame clause".into());
+                }
+                self.frame_bound(rows_mode)?
+            } else {
+                FrameBound::CurrentRow
+            };
+            if matches!(start, FrameBound::UnboundedFollowing) {
+                return Err("frame start cannot be UNBOUNDED FOLLOWING".into());
+            }
+            if matches!(end, FrameBound::UnboundedPreceding) {
+                return Err("frame end cannot be UNBOUNDED PRECEDING".into());
+            }
+            spec.frame = Some(Frame {
+                rows: rows_mode,
+                start,
+                end,
+            });
+        }
+        Ok(spec)
+    }
+
+    fn frame_bound(&mut self, rows_mode: bool) -> Result<FrameBound, String> {
+        if self.kw("unbounded") {
+            if self.kw("preceding") {
+                return Ok(FrameBound::UnboundedPreceding);
+            }
+            if self.kw("following") {
+                return Ok(FrameBound::UnboundedFollowing);
+            }
+            return Err("expected PRECEDING or FOLLOWING after UNBOUNDED".into());
+        }
+        if self.kw("current") {
+            if self.kw("row") {
+                return Ok(FrameBound::CurrentRow);
+            }
+            return Err("expected ROW after CURRENT".into());
+        }
+        let n = match self.next() {
+            Tok::Num(v) => v.parse::<i64>().map_err(|_| {
+                "frame offset must be an integer literal".to_string()
+            })?,
+            t => {
+                return Err(format!(
+                    "expected a frame offset (integer literal), found {:?}",
+                    t
+                ))
+            }
+        };
+        if self.kw("preceding") {
+            if !rows_mode {
+                return Err("RANGE with a numeric offset is not supported".into());
+            }
+            return Ok(FrameBound::Preceding(n));
+        }
+        if self.kw("following") {
+            if !rows_mode {
+                return Err("RANGE with a numeric offset is not supported".into());
+            }
+            return Ok(FrameBound::Following(n));
+        }
+        Err("expected PRECEDING or FOLLOWING after frame offset".into())
+    }
+
     fn select_stmt(&mut self) -> Result<SelectStmt, String> {
+        let mut windows: Vec<(String, WindowSpec)> = Vec::new();
         let distinct = if self.kw("distinct") {
             true
         } else {
@@ -1493,8 +2308,18 @@ impl Parser {
                             return Err("expected JOIN after CROSS".into());
                         }
                         JoinKind::Cross
-                    } else if self.kw("right") || self.kw("full") {
-                        return Err("RIGHT/FULL JOIN is not supported yet".into());
+                    } else if self.kw("right") {
+                        self.kw("outer");
+                        if !self.kw("join") {
+                            return Err("expected JOIN after RIGHT".into());
+                        }
+                        JoinKind::Right
+                    } else if self.kw("full") {
+                        self.kw("outer");
+                        if !self.kw("join") {
+                            return Err("expected JOIN after FULL".into());
+                        }
+                        JoinKind::Full
                     } else {
                         break;
                     };
@@ -1503,6 +2328,50 @@ impl Parser {
                         None
                     } else if self.kw("on") {
                         Some(self.expr()?)
+                    } else if self.kw("using") {
+                        // JOIN ... USING (c1, c2) rewrites to the
+                        // equality conjunction on the shared column
+                        // names. (PG additionally merges the output
+                        // columns; puddle keeps both, so the bare name
+                        // stays resolvable only when unambiguous.)
+                        if !self.op("(") {
+                            return Err("expected ( after USING".into());
+                        }
+                        let mut cols: Vec<String> = Vec::new();
+                        loop {
+                            cols.push(self.ident("column name")?);
+                            if self.op(",") {
+                                continue;
+                            }
+                            break;
+                        }
+                        if !self.op(")") {
+                            return Err("expected ) after USING list".into());
+                        }
+                        if cols.is_empty() {
+                            return Err("USING list cannot be empty".into());
+                        }
+                        // both sides qualified: the right with its table
+                        // name, the left with the FROM item's base table.
+                        // (PG merges the two output columns; puddle keeps
+                        // both, so a bare `id` in the SELECT list stays
+                        // ambiguous — qualify it. And in a chained join
+                        // the shared column must live in the base table.)
+                        let lhs = base.effective_name().to_string();
+                        let rhs = table.effective_name().to_string();
+                        let mut cond: Option<Expr> = None;
+                        for cn in cols {
+                            let eq = Expr::Bin(
+                                Box::new(Expr::QCol(lhs.clone(), cn.clone())),
+                                "=",
+                                Box::new(Expr::QCol(rhs.clone(), cn)),
+                            );
+                            cond = Some(match cond {
+                                Some(c) => Expr::Bin(Box::new(c), "and", Box::new(eq)),
+                                None => eq,
+                            });
+                        }
+                        cond
                     } else {
                         return Err("expected ON after JOIN".into());
                     };
@@ -1539,6 +2408,28 @@ impl Parser {
         } else {
             None
         };
+        // WINDOW w AS (spec) [, ...] — after HAVING, before ORDER BY (PG)
+        if self.kw("window") {
+            loop {
+                let wname = self.ident("window name")?;
+                if !self.kw("as") {
+                    return Err("expected AS after window name".into());
+                }
+                if !self.op("(") {
+                    return Err("expected ( after window name AS".into());
+                }
+                let mut spec = self.window_spec_body()?;
+                spec.name = Some(wname.clone());
+                if !self.op(")") {
+                    return Err("expected ) after window specification".into());
+                }
+                windows.push((wname, spec));
+                if self.op(",") {
+                    continue;
+                }
+                break;
+            }
+        }
         let mut order_by = Vec::new();
         if self.kw("order") {
             if !self.kw("by") {
@@ -1583,6 +2474,7 @@ impl Parser {
         }
         Ok(SelectStmt {
             distinct,
+            windows,
             items,
             from_items,
             where_,
@@ -1700,6 +2592,20 @@ impl Parser {
     fn finish_in(&mut self, l: Expr, neg: bool) -> Result<Expr, String> {
         if !self.op("(") {
             return Err("expected ( after IN".into());
+        }
+        // IN (SELECT ...): uncorrelated subquery, lowered at rewrite
+        // time; a UNION body is rejected with a clean error (the lowered
+        // form is a single SelectStmt)
+        if self.peek_kw("select") {
+            self.next(); // SELECT keyword (select_stmt expects it gone)
+            let first = self.select_stmt()?;
+            if self.peek_kw("union") {
+                return Err("UNION inside an IN-subquery is not supported".into());
+            }
+            if !self.op(")") {
+                return Err("expected ) after IN subquery".into());
+            }
+            return Ok(Expr::InSub(Box::new(l), Box::new(first), neg));
         }
         let mut list = Vec::new();
         loop {
@@ -1963,10 +2869,22 @@ impl Parser {
                     if !self.op(")") {
                         return Err("expected ) after count(*)".into());
                     }
+                    let filter = self.filter_clause()?.map(Box::new);
+                    if self.peek_kw("over") {
+                        self.next(); // OVER
+                        let spec = self.over_clause()?;
+                        return Ok(Expr::Win {
+                            kind: WinKind::Agg(AggKind::CountStar),
+                            args: vec![Expr::Lit(Value::Int(1))],
+                            spec: Box::new(spec),
+                            filter,
+                        });
+                    }
                     return Ok(Expr::Agg(
                         AggKind::CountStar,
                         Box::new(Expr::Lit(Value::Int(1))),
                         false,
+                        filter,
                     ));
                 }
                 let distinct = self.kw("distinct");
@@ -1974,7 +2892,21 @@ impl Parser {
                 if !self.op(")") {
                     return Err("expected ) after aggregate argument".into());
                 }
-                return Ok(Expr::Agg(kind, Box::new(arg), distinct));
+                let filter = self.filter_clause()?.map(Box::new);
+                if self.peek_kw("over") {
+                    if distinct {
+                        return Err("DISTINCT is not allowed in a window aggregate".into());
+                    }
+                    self.next(); // OVER
+                    let spec = self.over_clause()?;
+                    return Ok(Expr::Win {
+                        kind: WinKind::Agg(kind),
+                        args: vec![arg],
+                        spec: Box::new(spec),
+                        filter,
+                    });
+                }
+                return Ok(Expr::Agg(kind, Box::new(arg), distinct, filter));
             }
             // scalar function
             let mut args = Vec::new();
@@ -1989,6 +2921,45 @@ impl Parser {
                 if !self.op(")") {
                     return Err("expected ) after function arguments".into());
                 }
+            }
+            // FILTER syntactically precedes OVER and applies to aggregates
+            // only: catch it here so row_number() FILTER ... gives a proper
+            // error instead of a generic syntax error
+            let pre_filter = self.filter_clause()?;
+            if pre_filter.is_some() && !matches!(
+                fname.as_str(),
+                "count" | "sum" | "avg" | "min" | "max"
+            ) {
+                return Err("FILTER is not allowed on non-aggregate window functions".into());
+            }
+            if self.peek_kw("over") {
+                self.next(); // OVER
+                let kind = match fname.as_str() {
+                    "row_number" => WinKind::RowNumber,
+                    "rank" => WinKind::Rank,
+                    "dense_rank" => WinKind::DenseRank,
+                    "percent_rank" => WinKind::PercentRank,
+                    "cume_dist" => WinKind::CumeDist,
+                    "ntile" => WinKind::Ntile,
+                    "lag" => WinKind::Lag,
+                    "lead" => WinKind::Lead,
+                    "first_value" => WinKind::FirstValue,
+                    "last_value" => WinKind::LastValue,
+                    "nth_value" => WinKind::NthValue,
+                    _ => {
+                        return Err(format!(
+                            "function \"{}\" is not a window function",
+                            fname
+                        ))
+                    }
+                };
+                let spec = self.over_clause()?;
+                return Ok(Expr::Win {
+                    kind,
+                    args,
+                    spec: Box::new(spec),
+                    filter: None,
+                });
             }
             return Ok(Expr::Func(fname, args));
         }
@@ -2040,3 +3011,179 @@ impl Parser {
     }
 }
 
+
+
+// ------------------------------------------------- constraint rendering --
+// Renders a DEFAULT / CHECK expression back to SQL text so constraints can
+// round-trip through the manifest and the WAL (re-parsed on recovery).
+
+fn ty_sql(ty: &Ty) -> &'static str {
+    match ty {
+        Ty::Int => "int",
+        Ty::Float => "float",
+        Ty::Bool => "bool",
+        Ty::Text => "text",
+        Ty::Date => "date",
+        Ty::Time => "time",
+        Ty::Timestamp => "timestamp",
+        Ty::Interval => "interval",
+    }
+}
+
+fn lit_sql(v: &Value) -> String {
+    match v {
+        Value::Null => "NULL".into(),
+        Value::Bool(b) => if *b { "true".into() } else { "false".into() },
+        Value::Int(i) => i.to_string(),
+        Value::Float(f) => {
+            if f.is_finite() { format!("{}", f) } else { "NULL".into() }
+        }
+        Value::Text(t) => format!("'{}'", t.replace('\'', "''")),
+        Value::Date(d) => format!("DATE '{}'", d),
+        Value::Time(t) => format!("TIME '{}'", t),
+        Value::Timestamp(ts) => format!("TIMESTAMP '{}'", ts),
+        Value::Interval { .. } => "INTERVAL '0'".into(),
+    }
+}
+
+/// SQL text for a constraint expression (a parseable subset is enough:
+/// DEFAULT and CHECK bodies are ordinary scalar expressions).
+pub fn expr_to_sql(e: &Expr) -> String {
+    match e {
+        Expr::Lit(v) => lit_sql(v),
+        Expr::Col(c) => c.clone(),
+        Expr::QCol(t, c) => format!("{}.{}", t, c),
+        Expr::Param(n) => format!("${}", n),
+        Expr::AggRef(i) => format!("__agg{}", i),
+        Expr::Subquery(_) => "(SELECT ...)".into(),
+        Expr::Neg(a) => format!("(-{})", expr_to_sql(a)),
+        Expr::Not(a) => format!("(NOT {})", expr_to_sql(a)),
+        Expr::IsNull(a, n) => format!(
+            "({} IS {}NULL)",
+            expr_to_sql(a),
+            if *n { "" } else { "NOT " }
+        ),
+        Expr::Cast(a, t) => format!("({}::{})", expr_to_sql(a), ty_sql(t)),
+        Expr::Like(a, b, n) => format!(
+            "({} {}LIKE {})",
+            expr_to_sql(a),
+            if *n { "NOT " } else { "" },
+            expr_to_sql(b)
+        ),
+        Expr::Between(a, lo, hi, n) => format!(
+            "({} {}BETWEEN {} AND {})",
+            expr_to_sql(a),
+            if *n { "NOT " } else { "" },
+            expr_to_sql(lo),
+            expr_to_sql(hi)
+        ),
+        Expr::InList(a, l, n) => format!(
+            "({} {}IN ({}))",
+            expr_to_sql(a),
+            if *n { "NOT " } else { "" },
+            l.iter().map(expr_to_sql).collect::<Vec<_>>().join(", ")
+        ),
+        Expr::InSub(a, _, n) => format!(
+            "({} {}IN (SELECT ...))",
+            expr_to_sql(a),
+            if *n { "NOT " } else { "" }
+        ),
+        Expr::Bin(a, op, b) => {
+            format!("({} {} {})", expr_to_sql(a), op, expr_to_sql(b))
+        }
+        Expr::Case {
+            operand,
+            when_then,
+            else_,
+        } => {
+            let mut out = String::from("CASE");
+            if let Some(o) = operand {
+                out.push(' ');
+                out.push_str(&expr_to_sql(o));
+            }
+            for (w, t) in when_then {
+                out.push_str(" WHEN ");
+                out.push_str(&expr_to_sql(w));
+                out.push_str(" THEN ");
+                out.push_str(&expr_to_sql(t));
+            }
+            if let Some(x) = else_ {
+                out.push_str(" ELSE ");
+                out.push_str(&expr_to_sql(x));
+            }
+            out.push_str(" END");
+            out
+        }
+        Expr::Func(f, args) => format!(
+            "{}({})",
+            f,
+            args.iter().map(expr_to_sql).collect::<Vec<_>>().join(", ")
+        ),
+        Expr::Agg(kind, a, distinct, filter) => {
+            let kn = match kind {
+                AggKind::CountStar => "count",
+                AggKind::Count => "count",
+                AggKind::Sum => "sum",
+                AggKind::Avg => "avg",
+                AggKind::Min => "min",
+                AggKind::Max => "max",
+            };
+            let mut out = format!(
+                "{}({}{})",
+                kn,
+                if *distinct { "DISTINCT " } else { "" },
+                expr_to_sql(a)
+            );
+            if let Some(f) = filter {
+                out.push_str(&format!(" FILTER (WHERE {})", expr_to_sql(f)));
+            }
+            out
+        }
+        Expr::Win {
+            kind,
+            args,
+            spec,
+            filter,
+        } => {
+            let _ = filter;
+            format!(
+                "{}({}) OVER ({})",
+                match kind {
+                    WinKind::RowNumber => "row_number",
+                    WinKind::Rank => "rank",
+                    WinKind::DenseRank => "dense_rank",
+                    WinKind::PercentRank => "percent_rank",
+                    WinKind::CumeDist => "cume_dist",
+                    WinKind::Ntile => "ntile",
+                    WinKind::Lag => "lag",
+                    WinKind::Lead => "lead",
+                    WinKind::FirstValue => "first_value",
+                    WinKind::LastValue => "last_value",
+                    WinKind::NthValue => "nth_value",
+                    WinKind::Agg(_) => "sum",
+                },
+                args.iter().map(expr_to_sql).collect::<Vec<_>>().join(", "),
+                spec.partition_by
+                    .iter()
+                    .map(expr_to_sql)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+    }
+}
+
+/// Parses a bare expression from SQL text (constraint round-trip through
+/// the WAL/manifest: DEFAULT and CHECK bodies).
+pub fn parse_expr_text(s: &str) -> Option<Expr> {
+    let toks = lex(&format!("SELECT {}", s)).ok()?;
+    let mut p = Parser::new(toks);
+    let stmt = p.parse_one().ok()??;
+    match stmt {
+        Stmt::Select(sel) => match sel.items.into_iter().next()? {
+            SelectItem::Expr(e, _) => Some(e),
+            _ => None,
+        },
+        _ => None,
+    }
+}

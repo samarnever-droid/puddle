@@ -71,6 +71,9 @@ pub struct IndexDef {
     pub table_id: u64,
     pub method: String,
     pub col: String,
+    /// v2.2 CREATE UNIQUE INDEX
+    #[serde(default)]
+    pub unique: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -79,6 +82,15 @@ pub struct ManCol {
     pub ty: u8,
     #[serde(default)]
     pub not_null: bool,
+    /// v2.2 constraints (SQL text round-trips; absent in older manifests)
+    #[serde(default)]
+    pub primary_key: bool,
+    #[serde(default)]
+    pub unique: bool,
+    #[serde(default)]
+    pub default_sql: Option<String>,
+    #[serde(default)]
+    pub check_sql: Option<String>,
 }
 
 /// Checkpoint granularity: rows per part (Snowflake-style micro-partitions).
@@ -119,7 +131,15 @@ impl ReplayTab {
         ReplayTab {
             cols: cols
                 .into_iter()
-                .map(|(n, t, nn)| ColumnDef { name: n, ty: t, not_null: nn })
+                .map(|(n, t, nn)| ColumnDef {
+                    name: n,
+                    ty: t,
+                    not_null: nn,
+                    primary_key: false,
+                    unique: false,
+                    default: None,
+                    check: None,
+                })
                 .collect(),
             rows: Vec::new(),
             map: HashMap::new(),
@@ -303,6 +323,16 @@ impl Persist {
                     name: c.name.clone(),
                     ty,
                     not_null: c.not_null,
+                    primary_key: c.primary_key,
+                    unique: c.unique,
+                    default: c
+                        .default_sql
+                        .as_deref()
+                        .and_then(crate::sql::parse_expr_text),
+                    check: c
+                        .check_sql
+                        .as_deref()
+                        .and_then(crate::sql::parse_expr_text),
                 });
             }
             let mut tab = ReplayTab { cols, rows: Vec::new(), map: HashMap::new(), next_rowid_seed: man.next_rowid };
@@ -492,12 +522,42 @@ impl Persist {
                 "hash" => crate::sql::IdxMethod::Hash,
                 _ => crate::sql::IdxMethod::BTree,
             };
-            let idx = crate::engine::TableIndex::build(tab, colpos, method);
+            let mut idx = crate::engine::TableIndex::build(tab, colpos, method);
+            idx.unique = def.unique;
             tab.indexes.insert(name.clone(), idx);
             built.push(name);
         }
         if !built.is_empty() {
             log(format!("rebuilt {} secondary indexes", built.len()));
+        }
+        // implicit constraint indexes (PRIMARY KEY / UNIQUE) rebuild from
+        // the recovered column metadata — they are not registered as
+        // user indexes
+        let mut ncon = 0usize;
+        for (tname, tab) in tables.iter_mut() {
+            let wanted: Vec<(usize, String)> = tab
+                .cols
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.primary_key || c.unique)
+                .map(|(i, c)| {
+                    let iname = if c.primary_key {
+                        format!("{}_pkey", tname)
+                    } else {
+                        format!("{}_{}_key", tname, c.name)
+                    };
+                    (i, iname)
+                })
+                .collect();
+            for (i, iname) in wanted {
+                let mut idx = crate::engine::TableIndex::build(tab, i, crate::sql::IdxMethod::BTree);
+                idx.internal = true;
+                tab.indexes.insert(iname, idx);
+                ncon += 1;
+            }
+        }
+        if ncon > 0 {
+            log(format!("rebuilt {} constraint indexes", ncon));
         }
 
         let next_seq = store
@@ -738,6 +798,10 @@ impl Persist {
                     name: cn.clone(),
                     ty: crate::wal::ty_code(*ct),
                     not_null: *nn,
+                    primary_key: false,
+                    unique: false,
+                    default_sql: None,
+                    check_sql: None,
                 })
                 .collect(),
             parts: ts
@@ -868,6 +932,13 @@ impl Persist {
                         name: c.name.clone(),
                         ty: crate::wal::ty_code(c.ty),
                         not_null: c.not_null,
+                        primary_key: c.primary_key,
+                        unique: c.unique,
+                        default_sql: c
+                            .default
+                            .as_ref()
+                            .map(crate::sql::expr_to_sql),
+                        check_sql: c.check.as_ref().map(crate::sql::expr_to_sql),
                     })
                     .collect(),
                 parts: parts.clone(),
@@ -1163,6 +1234,16 @@ impl Persist {
                     name: c.name.clone(),
                     ty,
                     not_null: c.not_null,
+                    primary_key: c.primary_key,
+                    unique: c.unique,
+                    default: c
+                        .default_sql
+                        .as_deref()
+                        .and_then(crate::sql::parse_expr_text),
+                    check: c
+                        .check_sql
+                        .as_deref()
+                        .and_then(crate::sql::parse_expr_text),
                 });
             }
                 let want_width = cols.len();
@@ -1350,6 +1431,22 @@ fn apply_rec(
 ) {
     let _ = seq;
     match rec {
+        WalRec::Constraints { name, cols } => {
+            // constraint metadata for a table created earlier in the
+            // stream; exprs round-trip as SQL text
+            if let Some(tab) = by_id.get_mut(&id) {
+                for c in cols {
+                    let Some(cd) = tab.cols.iter_mut().find(|cd| cd.name == c.name) else {
+                        continue;
+                    };
+                    cd.primary_key = c.primary_key;
+                    cd.unique = c.unique;
+                    cd.default = c.default_sql.as_deref().and_then(crate::sql::parse_expr_text);
+                    cd.check = c.check_sql.as_deref().and_then(crate::sql::parse_expr_text);
+                }
+            }
+            let _ = name;
+        }
         WalRec::Create { name, cols } => {
             by_id.insert(id, ReplayTab::fresh(cols));
             name_of.insert(id, name);
@@ -1368,6 +1465,10 @@ fn apply_rec(
                         name: col.0,
                         ty: col.1,
                         not_null: col.2,
+                        primary_key: false,
+                        unique: false,
+                        default: None,
+                        check: None,
                     });
                     for (_, row) in tab.rows.iter_mut() {
                         row.push(Value::Null);

@@ -23,6 +23,10 @@ pub const REC_DELETE: u8 = 3;
 pub const REC_CREATE: u8 = 4;
 pub const REC_DROP: u8 = 5;
 pub const REC_ALTER_ADD: u8 = 6;
+/// v2.2 constraint metadata following a Create: per-column
+/// (name, pk, unique, default_sql, check_sql). New record kind, so WALs
+/// written by older puddle binaries simply never contain it.
+pub const REC_CONSTRAINTS: u8 = 7;
 
 // ty codes shared with the part format
 pub const TY_BOOL: u8 = 0;
@@ -72,6 +76,23 @@ pub enum WalRec {
     /// from the record's seq onward; existing rows read as NULL. Old parts
     /// simply lack the trailing column and are padded at load time.
     AlterAdd { name: String, col: (String, Ty, bool) },
+    /// Column constraints for the named table (PK / UNIQUE / DEFAULT /
+    /// CHECK, expressed as SQL text for the exprs). Logged right after
+    /// Create when any column carries a constraint.
+    Constraints {
+        name: String,
+        cols: Vec<ConstraintRec>,
+    },
+}
+
+/// One column's constraint metadata, WAL form.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConstraintRec {
+    pub name: String,
+    pub primary_key: bool,
+    pub unique: bool,
+    pub default_sql: Option<String>,
+    pub check_sql: Option<String>,
 }
 
 // ------------------------------------------------------------- value codec --
@@ -245,6 +266,25 @@ pub fn encode_segment(out: &mut Vec<u8>, items: &[(u64, WalRec)], lsn: u64) {
                 payload.extend_from_slice(&id.to_be_bytes());
                 enc_str(&mut payload, name);
             }
+            WalRec::Constraints { name, cols } => {
+                payload.push(REC_CONSTRAINTS);
+                payload.extend_from_slice(&id.to_be_bytes());
+                enc_str(&mut payload, name);
+                payload.extend_from_slice(&(cols.len() as u32).to_be_bytes());
+                for c in cols {
+                    enc_str(&mut payload, &c.name);
+                    let flags = (c.primary_key as u8) | ((c.unique as u8) << 1)
+                        | ((c.default_sql.is_some() as u8) << 2)
+                        | ((c.check_sql.is_some() as u8) << 3);
+                    payload.push(flags);
+                    if let Some(d) = &c.default_sql {
+                        enc_str(&mut payload, d);
+                    }
+                    if let Some(ck) = &c.check_sql {
+                        enc_str(&mut payload, ck);
+                    }
+                }
+            }
             WalRec::AlterAdd { name, col } => {
                 payload.push(REC_ALTER_ADD);
                 payload.extend_from_slice(&id.to_be_bytes());
@@ -295,6 +335,15 @@ fn u64_at(b: &[u8], p: usize) -> Option<u64> {
     let mut a = [0u8; 8];
     a.copy_from_slice(&b[p..p + 8]);
     Some(u64::from_be_bytes(a))
+}
+
+fn read_u32(b: &[u8], p: &mut usize) -> Option<u32> {
+    if *p + 4 > b.len() {
+        return None;
+    }
+    let v = u32::from_be_bytes([b[*p], b[*p + 1], b[*p + 2], b[*p + 3]]);
+    *p += 4;
+    Some(v)
 }
 
 fn dec_str(b: &[u8], p: &mut usize) -> Option<String> {
@@ -418,6 +467,46 @@ pub fn decode_segment(data: &[u8]) -> Replay {
                 };
                 WalRec::Drop { name }
             }
+            REC_CONSTRAINTS => {
+                let name = match dec_str(payload, &mut q) {
+                    Some(v) => v,
+                    None => return Replay::Corrupt("bad table name".into()),
+                };
+                let n = match read_u32(payload, &mut q) {
+                    Some(v) => v as usize,
+                    None => return Replay::Corrupt("bad constraint count".into()),
+                };
+                let mut cols = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let cn = match dec_str(payload, &mut q) {
+                        Some(v) => v,
+                        None => return Replay::Corrupt("bad column name".into()),
+                    };
+                    let flags = match payload.get(q) {
+                        Some(&f) => f,
+                        None => return Replay::Corrupt("missing constraint flags".into()),
+                    };
+                    q += 1;
+                    let default_sql = if flags & 0b0100 != 0 {
+                        dec_str(payload, &mut q)
+                    } else {
+                        None
+                    };
+                    let check_sql = if flags & 0b1000 != 0 {
+                        dec_str(payload, &mut q)
+                    } else {
+                        None
+                    };
+                    cols.push(ConstraintRec {
+                        name: cn,
+                        primary_key: flags & 1 != 0,
+                        unique: flags & 2 != 0,
+                        default_sql,
+                        check_sql,
+                    });
+                }
+                WalRec::Constraints { name, cols }
+            }
             REC_ALTER_ADD => {
                 let name = match dec_str(payload, &mut q) {
                     Some(v) => v,
@@ -458,6 +547,63 @@ mod tests {
         assert_eq!(segment_lsn(&[0u8; 10]), None);
         // matches what decode replays
         assert!(matches!(decode_segment(&buf), Replay::Ok { items, torn: false } if items.len() == 1));
+    }
+
+    #[test]
+    fn constraints_roundtrip() {
+        let items = vec![(
+            11u64,
+            WalRec::Constraints {
+                name: "t".into(),
+                cols: vec![
+                    ConstraintRec {
+                        name: "id".into(),
+                        primary_key: true,
+                        unique: false,
+                        default_sql: None,
+                        check_sql: None,
+                    },
+                    ConstraintRec {
+                        name: "email".into(),
+                        primary_key: false,
+                        unique: true,
+                        default_sql: Some("'anon'".into()),
+                        check_sql: Some("length(email) > 3".into()),
+                    },
+                ],
+            },
+        )];
+        let mut buf = Vec::new();
+        encode_segment(&mut buf, &items, 5);
+        match decode_segment(&buf) {
+            Replay::Ok { items, torn: false } => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].0, 11);
+                assert_eq!(
+                    items[0].1,
+                    WalRec::Constraints {
+                        name: "t".into(),
+                        cols: vec![
+                            ConstraintRec {
+                                name: "id".into(),
+                                primary_key: true,
+                                unique: false,
+                                default_sql: None,
+                                check_sql: None,
+                            },
+                            ConstraintRec {
+                                name: "email".into(),
+                                primary_key: false,
+                                unique: true,
+                                default_sql: Some("'anon'".into()),
+                                check_sql: Some("length(email) > 3".into()),
+                            },
+                        ],
+                    }
+                );
+            }
+            _ => panic!("expected clean replay"),
+        }
     }
 
     #[test]

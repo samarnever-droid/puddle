@@ -7,7 +7,7 @@ use crate::persist::Persist;
 use crate::sql::{
     AsOf, ColumnDef, Expr, FromItem, JoinKind, SelectItem, SelectStmt, Stmt, TableRef,
 };
-use crate::vecx::{hash_join, veval, VSrc};
+use crate::vecx::{hash_join, veval, JoinMode, VSrc};
 use crate::wal::WalRec;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use crate::temporal;
+use std::cell::RefCell;
 
 // ------------------------------------------------------------------- values --
 
@@ -327,6 +328,11 @@ pub struct TableIndex {
     pub method: crate::sql::IdxMethod,
     pub col: usize,
     pub map: IdxMap,
+    /// implicit constraint index (PRIMARY KEY / UNIQUE): backed by the
+    /// column constraint, not droppable via DROP INDEX, enforces 23505
+    pub internal: bool,
+    /// explicit CREATE UNIQUE INDEX: user-droppable, enforces 23505
+    pub unique: bool,
 }
 
 #[derive(Clone)]
@@ -340,6 +346,8 @@ impl TableIndex {
         let mut idx = TableIndex {
             method,
             col,
+            internal: false,
+            unique: false,
             map: match method {
                 crate::sql::IdxMethod::Hash => {
                     IdxMap::Hash(std::collections::HashMap::new())
@@ -529,6 +537,392 @@ pub enum StmtResult {
     Tag(String),
 }
 
+// ------------------------------------------------------------------ CTEs --
+// WITH visibility is per-executing-statement state, but every connection
+// is one thread, so a thread-local stack of frames is exact: nested WITHs
+// push frames (inner shadows outer), derived-table subqueries execute
+// recursively on the same thread and see the enclosing frames, and
+// concurrent connections never share frames.
+struct CteFrame {
+    /// CTE definitions in declaration order; a body may only see the
+    /// CTEs declared before it (PG ordering rules)
+    defs: Vec<crate::sql::CteDef>,
+    /// indices whose bodies are currently materializing (self- and
+    /// forward references are invisible while any of these is in flight)
+    in_flight: Vec<usize>,
+    cache: HashMap<String, TableShape>,
+}
+
+thread_local! {
+    static CTE_STACK: RefCell<Vec<CteFrame>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Runs f with a fresh CTE frame holding these defs; the frame is popped
+/// even when f errors (no panic paths exist, but Drop makes it airtight).
+fn with_cte_frame<T>(defs: Vec<crate::sql::CteDef>, f: impl FnOnce() -> R<T>) -> R<T> {
+    CTE_STACK.with(|st| {
+        st.borrow_mut().push(CteFrame {
+            defs,
+            in_flight: Vec::new(),
+            cache: HashMap::new(),
+        });
+    });
+    struct Pop;
+    impl Drop for Pop {
+        fn drop(&mut self) {
+            CTE_STACK.with(|st| {
+                st.borrow_mut().pop();
+            });
+        }
+    }
+    let _pop = Pop;
+    f()
+}
+
+/// A name is visible in a frame iff it was declared before every def
+/// currently materializing in that frame.
+fn cte_visible(frame: &CteFrame, idx: usize) -> bool {
+    frame.in_flight.iter().all(|&e| idx < e)
+}
+
+/// True when an active CTE frame defines a name this query reads in its
+/// FROM list — such a name must resolve to the CTE, so the vectorized
+/// path (which looks tables up in the catalog directly, bypassing
+/// load_table and therefore the CTE stack) must stand down.
+fn cte_shadows_from(sel: &SelectStmt) -> bool {
+    let mut any = false;
+    CTE_STACK.with(|st| {
+        let st = st.borrow();
+        if st.is_empty() {
+            return;
+        }
+        for fi in &sel.from_items {
+            for tr in std::iter::once(&fi.base).chain(fi.joins.iter().map(|j| &j.table)) {
+                if tr.subquery.is_none()
+                    && st
+                        .iter()
+                        .any(|f| f.defs.iter().any(|d| d.name == tr.name))
+                {
+                    any = true;
+                    return;
+                }
+            }
+        }
+    });
+    any
+}
+
+fn cte_missing(name: &str) -> PqError {
+    PqError::new("42P01", format!("relation \"{}\" does not exist", name))
+}
+
+/// WITH RECURSIVE execution (PG semantics):
+///
+///   WITH RECURSIVE name [(cols)] AS (
+///       anchor-term                  -- must not reference `name`
+///       UNION [ALL] recursive-term   -- references `name`
+///   ) body
+///
+/// The anchor runs once. The recursive term then runs repeatedly: each
+/// iteration sees the rows the previous iteration produced (UNION ALL:
+/// the delta) or the whole working table so far (UNION distinct), and
+/// its output is appended. Iteration stops when an iteration adds no
+/// rows. A generous iteration cap turns runaway recursion into a 54000
+/// error instead of an OOM — PG has no cap (it relies on statement
+/// timeouts); a documented divergence.
+const RECURSION_ITERATION_CAP: usize = 54000;
+
+/// Does this SELECT reference the named table directly in its FROM list
+/// (base table or join)? Derived tables nesting the reference are not
+/// detected and evaluate as plain (non-recursive) CTE bodies.
+fn sel_refs_table(sel: &crate::sql::SelectStmt, name: &str) -> bool {
+    for item in &sel.from_items {
+        for tr in std::iter::once(&item.base).chain(item.joins.iter().map(|j| &j.table)) {
+            if tr.subquery.is_none() && tr.name == name {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+impl Db {
+    fn execute_with_recursive(
+        &self,
+        ctes: &[crate::sql::CteDef],
+        body: &Stmt,
+        params: &[Value],
+    ) -> R<StmtResult> {
+        if ctes.len() != 1 {
+            return Err(PqError::new(
+                "0A000",
+                "WITH RECURSIVE supports exactly one CTE for now",
+            ));
+        }
+        let cte = &ctes[0];
+        // anchor + recursive tail, or None when nothing is actually
+        // recursive (RECURSIVE keyword on a plain query is legal PG)
+        let parts: Option<(&Stmt, &[Stmt], bool)> = match &*cte.body {
+            Stmt::Union { arms, all, .. } if arms.len() >= 2 => {
+                let rec = arms[1..].iter().any(|a| match a {
+                    Stmt::Select(s) => sel_refs_table(s, &cte.name),
+                    _ => false, // VALUES arms are constant
+                });
+                if rec {
+                    let (first, rest) = arms.split_first().unwrap_or((&arms[0], &[]));
+                    Some((first, rest, *all))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        let (anchor, tail, union_all) = match parts {
+            Some(p) => p,
+            None => return with_cte_frame(ctes.to_vec(), || self.execute(&cte.body, params)),
+        };
+
+        // push the CTE frame; the anchor runs with the CTE in flight so a
+        // self-reference is 42P01 (the anchor must not be recursive)
+        CTE_STACK.with(|st| {
+            st.borrow_mut().push(CteFrame {
+                defs: ctes.to_vec(),
+                in_flight: Vec::new(),
+                cache: HashMap::new(),
+            })
+        });
+        struct Pop;
+        impl Drop for Pop {
+            fn drop(&mut self) {
+                CTE_STACK.with(|st| {
+                    st.borrow_mut().pop();
+                });
+            }
+        }
+        let _pop = Pop;
+        let fi = CTE_STACK.with(|st| st.borrow().len() - 1);
+        CTE_STACK.with(|st| st.borrow_mut()[fi].in_flight.push(0));
+        let anchor_res = self.execute(anchor, params);
+        CTE_STACK.with(|st| {
+            if let Some(f) = st.borrow_mut().get_mut(fi) {
+                f.in_flight.pop();
+            }
+        });
+        let (mut cols, mut rows) = match anchor_res? {
+            StmtResult::Rows { cols, rows, .. } => (cols, rows),
+            StmtResult::Tag(_) => {
+                return Err(PqError::new(
+                    "42609",
+                    format!("WITH query \"{}\" must be a SELECT", cte.name),
+                ))
+            }
+        };
+        if !cte.col_aliases.is_empty() {
+            if cte.col_aliases.len() != cols.len() {
+                return Err(PqError::new(
+                    "42P18",
+                    format!(
+                        "WITH query \"{}\" has {} columns available but {} columns specified",
+                        cte.name,
+                        cols.len(),
+                        cte.col_aliases.len()
+                    ),
+                ));
+            }
+            for (c, a) in cols.iter_mut().zip(cte.col_aliases.iter()) {
+                c.0 = a.clone();
+            }
+        }
+        // UNION (distinct): dedup the anchor output, then track seen keys
+        let mut seen: std::collections::HashSet<Vec<_>> = std::collections::HashSet::new();
+        if !union_all {
+            rows.retain(|r| seen.insert(r.iter().map(gkey).collect::<Vec<_>>()));
+        }
+        // worklist: iterate the recursive term until it stops producing
+        let mut delta = rows.clone();
+        let mut iters = 0usize;
+        while !delta.is_empty() {
+            iters += 1;
+            if iters > RECURSION_ITERATION_CAP {
+                return Err(PqError::new(
+                    "54000",
+                    format!(
+                        "recursive query \"{}\" exceeded the iteration cap ({})",
+                        cte.name, RECURSION_ITERATION_CAP
+                    ),
+                ));
+            }
+            // bind the CTE name: UNION ALL sees only the delta; UNION sees
+            // the full working table
+            let working: Vec<Vec<Value>> = if union_all {
+                delta.clone()
+            } else {
+                rows.clone()
+            };
+            CTE_STACK.with(|st| {
+                st.borrow_mut()[fi]
+                    .cache
+                    .insert(cte.name.clone(), (cols.clone(), working))
+            });
+            let mut new_rows: Vec<Vec<Value>> = Vec::new();
+            for arm in tail {
+                if let StmtResult::Rows { rows: r, .. } = self.execute(arm, params)? {
+                    new_rows.extend(r);
+                }
+            }
+            if union_all {
+                delta = new_rows;
+                rows.extend(delta.iter().cloned());
+            } else {
+                let fresh: Vec<Vec<Value>> = new_rows
+                    .into_iter()
+                    .filter(|r| seen.insert(r.iter().map(gkey).collect::<Vec<_>>()))
+                    .collect();
+                delta = fresh.clone();
+                rows.extend(fresh);
+            }
+        }
+        // final cached binding, then run the attached body inside the frame
+        CTE_STACK.with(|st| {
+            st.borrow_mut()[fi]
+                .cache
+                .insert(cte.name.clone(), (cols, rows))
+        });
+        self.execute(body, params)
+    }
+}
+
+/// Rows of a named CTE, materializing the body on first use. Innermost
+/// frame wins (shadowing). All RefCell borrows are short: the body
+/// executes with no borrow held, so nested lookups re-enter freely.
+fn cte_lookup_rows(db: &Db, name: &str, params: &[Value]) -> Option<R<TableShape>> {
+    // locate the definition (short mutable borrow)
+    let found: Option<Result<(usize, usize, crate::sql::CteDef), PqError>> =
+        CTE_STACK.with(|st| {
+            let st = st.borrow_mut();
+            for fi in (0..st.len()).rev() {
+                if let Some(idx) = st[fi].defs.iter().position(|d| d.name == name) {
+                    if !cte_visible(&st[fi], idx) {
+                        return Some(Err(cte_missing(name)));
+                    }
+                    return Some(Ok((fi, idx, st[fi].defs[idx].clone())));
+                }
+            }
+            None
+        });
+    let (fi, idx, def) = match found {
+        None => return None,
+        Some(Err(e)) => return Some(Err(e)),
+        Some(Ok(x)) => x,
+    };
+    // cached? (short immutable borrow)
+    {
+        let hit = CTE_STACK.with(|st| {
+            let st = st.borrow();
+            st.get(fi)
+                .and_then(|f| f.cache.get(name))
+                .cloned()
+        });
+        if let Some(shape) = hit {
+            return Some(Ok(shape));
+        }
+    }
+    // materialize: mark in flight (short borrow), execute with no borrow
+    CTE_STACK.with(|st| st.borrow_mut()[fi].in_flight.push(idx));
+    let r = db.execute(&def.body, params);
+    CTE_STACK.with(|st| {
+        if let Some(f) = st.borrow_mut().get_mut(fi) {
+            f.in_flight.pop();
+        }
+    });
+    let mut shape = match r {
+        Ok(StmtResult::Rows { cols, rows, .. }) => (cols, rows),
+        Ok(StmtResult::Tag(_)) => {
+            return Some(Err(PqError::new(
+                "42609",
+                format!("WITH query \"{}\" must be a SELECT", name),
+            )))
+        }
+        Err(e) => return Some(Err(e)),
+    };
+    if !def.col_aliases.is_empty() {
+        if def.col_aliases.len() != shape.0.len() {
+            return Some(Err(PqError::new(
+                "42P18",
+                format!(
+                    "WITH query \"{}\" has {} columns available but {} columns specified",
+                    name,
+                    shape.0.len(),
+                    def.col_aliases.len()
+                ),
+            )));
+        }
+        for (c, a) in shape.0.iter_mut().zip(def.col_aliases.iter()) {
+            c.0 = a.clone();
+        }
+    }
+    CTE_STACK.with(|st| {
+        if let Some(f) = st.borrow_mut().get_mut(fi) {
+            f.cache.insert(name.to_string(), shape.clone());
+        }
+    });
+    Some(Ok(shape))
+}
+
+/// Output schema of a named CTE without executing it (recursive describe
+/// for the metadata path — Describe on a parameterized WITH must not run
+/// the bodies).
+fn cte_lookup_schema(db: &Db, name: &str) -> Option<R<Vec<(String, Ty)>>> {
+    // locate + clone the def (short immutable borrow)
+    let found: Option<Result<crate::sql::CteDef, PqError>> = CTE_STACK.with(|st| {
+        let st = st.borrow();
+        for frame in st.iter().rev() {
+            if let Some(idx) = frame.defs.iter().position(|d| d.name == name) {
+                if !cte_visible(frame, idx) {
+                    return Some(Err(cte_missing(name)));
+                }
+                return Some(Ok(frame.defs[idx].clone()));
+            }
+        }
+        None
+    });
+    let def = match found {
+        None => return None,
+        Some(Err(e)) => return Some(Err(e)),
+        Some(Ok(x)) => x,
+    };
+    // compute the schema with no borrow held (this recurses back into
+    // lookups for nested CTEs / derived tables)
+    let mut cols = match db.stmt_output_cols(&def.body) {
+        Ok(c) => c,
+        Err(e) => return Some(Err(e)),
+    };
+    if !def.col_aliases.is_empty() {
+        if def.col_aliases.len() != cols.len() {
+            return Some(Err(PqError::new(
+                "42P18",
+                format!(
+                    "WITH query \"{}\" has {} columns available but {} columns specified",
+                    name,
+                    cols.len(),
+                    def.col_aliases.len()
+                ),
+            )));
+        }
+        for (c, a) in cols.iter_mut().zip(def.col_aliases.iter()) {
+            c.0 = a.clone();
+        }
+    }
+    Some(Ok(cols))
+}
+
+impl Default for Db {
+    /// `Db::default()` is the in-memory database, like `Db::new()`.
+    fn default() -> Db {
+        Db::new()
+    }
+}
+
 impl Db {
     pub fn new() -> Db {
         Db {
@@ -554,6 +948,140 @@ impl Db {
             persist: Some(persist),
             asof_reader: None,
         }
+    }
+
+    // ------------------------------------------------------ constraints --
+
+    /// Builds the implicit indexes for a freshly created table's PRIMARY
+    /// KEY / UNIQUE columns (PG names: <t>_pkey, <t>_<col>_key).
+    fn build_constraint_indexes(tab: &mut Table, tname: &str) {
+        let wanted: Vec<(usize, String)> = tab
+            .cols
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.primary_key || c.unique)
+            .map(|(i, c)| {
+                let iname = if c.primary_key {
+                    format!("{}_pkey", tname)
+                } else {
+                    format!("{}_{}_key", tname, c.name)
+                };
+                (i, iname)
+            })
+            .collect();
+        for (i, iname) in wanted {
+            let mut idx = TableIndex::build(tab, i, crate::sql::IdxMethod::BTree);
+            idx.internal = true;
+            tab.indexes.insert(iname, idx);
+        }
+    }
+
+    /// NOT NULL + CHECK + UNIQUE validation of one candidate row.
+    /// `skip_rowid` excludes a row being updated from the unique probe;
+    /// `pending` carries keys claimed by earlier rows of the same batch.
+    fn check_row_constraints(
+        tab: &Table,
+        tname: &str,
+        vals: &[Value],
+        skip_rowid: Option<u64>,
+        pending: &mut std::collections::HashSet<(String, IKey)>,
+        params: &[Value],
+        skip_uniq_col: Option<usize>,
+    ) -> R<()> {
+        // NOT NULL
+        for (i, cdef) in tab.cols.iter().enumerate() {
+            if cdef.not_null && matches!(vals[i], Value::Null) {
+                return Err(PqError::new(
+                    "23502",
+                    format!(
+                        "null value in column \"{}\" violates not-null constraint",
+                        cdef.name
+                    ),
+                ));
+            }
+        }
+        // CHECK (name-qualified scope over the table's columns)
+        let mut scope = Scope::empty();
+        scope.push(
+            tname,
+            tab.cols.iter().map(|c| (c.name.clone(), c.ty)).collect(),
+        );
+        for cdef in tab.cols.iter() {
+            let Some(ck) = &cdef.check else { continue };
+            let ctx = Ctx {
+                scope: &scope,
+                row: vals,
+                aggs: &[],
+                params,
+            };
+            // PG: a CHECK passes on TRUE or NULL; only FALSE violates
+            if matches!(eval(ck, &ctx)?, Value::Bool(false)) {
+                return Err(PqError::new(
+                    "23514",
+                    format!(
+                        "new row for relation \"{}\" violates check constraint \"{}_{}_check\"",
+                        tname, tname, cdef.name
+                    ),
+                ));
+            }
+        }
+        // UNIQUE / PRIMARY KEY via implicit indexes (NULLs never conflict).
+        // `skip_uniq_col` exempts the ON CONFLICT arbiter column: its
+        // conflicts are resolved by the ON CONFLICT clause, not rejected.
+        for (iname, ix) in tab.indexes.iter() {
+            if (!ix.internal && !ix.unique) || Some(ix.col) == skip_uniq_col {
+                continue;
+            }
+            if let Some(k) = IKey::of(&vals[ix.col]) {
+                for &rid in ix.lookup(&k) {
+                    if Some(rid) != skip_rowid {
+                        return Err(PqError::new(
+                            "23505",
+                            format!(
+                                "duplicate key value violates unique constraint \"{}\"",
+                                iname
+                            ),
+                        ));
+                    }
+                }
+                if !pending.insert((iname.clone(), k)) {
+                    return Err(PqError::new(
+                        "23505",
+                        format!(
+                            "duplicate key value violates unique constraint \"{}\"",
+                            iname
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Fills columns omitted by an INSERT/COPY column list with their
+    /// DEFAULT (const-evaluated); columns without a default stay NULL.
+    fn fill_defaults(
+        tab: &Table,
+        colpos: &[usize],
+        vals: &mut [Value],
+        params: &[Value],
+    ) -> R<()> {
+        let empty_scope = Scope::empty();
+        for (i, cdef) in tab.cols.iter().enumerate() {
+            if colpos.contains(&i) || !matches!(vals[i], Value::Null) {
+                continue;
+            }
+            if let Some(d) = &cdef.default {
+                let ctx = Ctx {
+                    scope: &empty_scope,
+                    row: &[],
+                    aggs: &[],
+                    params,
+                };
+                vals[i] = coerce(eval(d, &ctx)?, cdef.ty)?;
+            }
+        }
+        Ok(())
     }
 
     /// WAL-log one statement/txn batch (no-op without a persist layer).
@@ -780,6 +1308,7 @@ impl Db {
             pos
         };
         let mut staged: Vec<Vec<Value>> = Vec::with_capacity(raw_rows.len());
+        let mut pending: std::collections::HashSet<(String, IKey)> = std::collections::HashSet::new();
         for (i, raw) in raw_rows.iter().enumerate() {
             if raw.len() != colpos.len() {
                 return Err(PqError::new(
@@ -809,6 +1338,8 @@ impl Db {
                 }
                 vals[p] = v;
             }
+            Self::fill_defaults(tab, &colpos, &mut vals, &[])?;
+            Self::check_row_constraints(tab, &tr.name, &vals, None, &mut pending, &[], None)?;
             staged.push(vals);
         }
         // ONE atomic segment for the whole COPY (statement-atomic, fast)
@@ -850,7 +1381,7 @@ impl Db {
     ) -> R<TableShape> {
         match src {
             crate::sql::CopySource::Table(tr, cols) => {
-                let (tcols, rows) = self.load_table(tr)?;
+                let (tcols, rows) = self.load_table(tr, &[])?;
                 if cols.is_empty() {
                     return Ok((tcols, rows));
                 }
@@ -886,6 +1417,16 @@ impl Db {
 
     pub fn execute(&self, stmt: &Stmt, params: &[Value]) -> R<StmtResult> {
         match stmt {
+            Stmt::With {
+                recursive,
+                ctes,
+                body,
+            } => {
+                if *recursive {
+                    return self.execute_with_recursive(ctes, body, params);
+                }
+                with_cte_frame(ctes.clone(), || self.execute(body, params))
+            }
             Stmt::CreateTable {
                 name,
                 if_not_exists,
@@ -913,6 +1454,13 @@ impl Db {
                         ));
                     }
                 }
+                let npk = cols.iter().filter(|c| c.primary_key).count();
+                if npk > 1 {
+                    return Err(PqError::new(
+                        "42P16",
+                        format!("multiple primary keys for table \"{}\" are not allowed", name),
+                    ));
+                }
                 if let Some(p) = &self.persist {
                     let cts: Vec<(String, Ty, bool)> = cols
                         .iter()
@@ -920,15 +1468,37 @@ impl Db {
                         .collect();
                     p.register(name, &cts)
                         .map_err(|e| PqError::new("58030", format!("register: {}", e)))?;
-                    self.log_txn(&[(
-                        name.clone(),
-                        vec![WalRec::Create {
+                    let mut recs = vec![WalRec::Create {
+                        name: name.clone(),
+                        cols: cts,
+                    }];
+                    // constraint metadata follows Create (v2.2 WAL record;
+                    // only when some column actually carries a constraint)
+                    if cols.iter().any(|c| {
+                        c.primary_key || c.unique || c.default.is_some() || c.check.is_some()
+                    }) {
+                        recs.push(WalRec::Constraints {
                             name: name.clone(),
-                            cols: cts,
-                        }],
-                    )])?;
+                            cols: cols
+                                .iter()
+                                .map(|c| crate::wal::ConstraintRec {
+                                    name: c.name.clone(),
+                                    primary_key: c.primary_key,
+                                    unique: c.unique,
+                                    default_sql: c
+                                        .default
+                                        .as_ref()
+                                        .map(crate::sql::expr_to_sql),
+                                    check_sql: c.check.as_ref().map(crate::sql::expr_to_sql),
+                                })
+                                .collect(),
+                        });
+                    }
+                    self.log_txn(&[(name.clone(), recs)])?;
                 }
-                t.insert(name.clone(), Table::empty(cols.clone(), 1));
+                let mut tab = Table::empty(cols.clone(), 1);
+                Self::build_constraint_indexes(&mut tab, name);
+                t.insert(name.clone(), tab);
                 drop(t);
                 self.mark_dirty(name);
                 Ok(StmtResult::Tag("CREATE TABLE".into()))
@@ -964,6 +1534,7 @@ impl Db {
                 table,
                 method,
                 col,
+                unique,
             } => {
                 let mut t = self.tables.write().unwrap_or_else(|e| e.into_inner());
                 if !t.contains_key(table) {
@@ -998,7 +1569,27 @@ impl Db {
                         format!("relation \"{}\" already exists", name),
                     ));
                 }
-                let idx = TableIndex::build(tab, colpos, *method);
+                let mut idx = TableIndex::build(tab, colpos, *method);
+                // CREATE UNIQUE INDEX on data that already violates the
+                // constraint is rejected, exactly like PG
+                if *unique {
+                    let mut seen: std::collections::HashSet<IKey> =
+                        std::collections::HashSet::new();
+                    for r in 0..tab.nrows() {
+                        if let Some(k) = IKey::of(&tab.columns[colpos][r]) {
+                            if !seen.insert(k) {
+                                return Err(PqError::new(
+                                    "23505",
+                                    format!(
+                                        "could not create unique index \"{}\"",
+                                        name
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                    idx.unique = true;
+                }
                 if let Some(p) = &self.persist {
                     let def = crate::persist::IndexDef {
                         table: table.clone(),
@@ -1008,13 +1599,16 @@ impl Db {
                             crate::sql::IdxMethod::Hash => "hash".into(),
                         },
                         col: col.clone(),
+                        unique: *unique,
                     };
                     p.register_index(&name, &def)
                         .map_err(|e| PqError::new("58030", format!("register index: {}", e)))?;
                 }
                 tab.indexes.insert(name, idx);
                 drop(t);
-                Ok(StmtResult::Tag("CREATE INDEX".into()))
+                Ok(StmtResult::Tag(
+                    if *unique { "CREATE UNIQUE INDEX" } else { "CREATE INDEX" }.into(),
+                ))
             }
             Stmt::DropIndex { name, if_exists } => {
                 let mut t = self.tables.write().unwrap_or_else(|e| e.into_inner());
@@ -1037,6 +1631,15 @@ impl Db {
                         ));
                     }
                 };
+                if t.get(&tn).unwrap().indexes[name].internal {
+                    return Err(PqError::new(
+                        "0A000",
+                        format!(
+                            "cannot drop index \"{}\": it backs a PRIMARY KEY or UNIQUE constraint",
+                            name
+                        ),
+                    ));
+                }
                 t.get_mut(&tn).unwrap().indexes.remove(name);
                 drop(t);
                 if let Some(p) = &self.persist {
@@ -1049,6 +1652,8 @@ impl Db {
                 table,
                 cols,
                 rows,
+                query,
+                conflict,
                 returning,
             } => {
                 if table.as_of.is_some() {
@@ -1057,6 +1662,53 @@ impl Db {
                         "AS OF is not allowed on a INSERT target",
                     ));
                 }
+                // INSERT ... SELECT: run the source query before taking
+                // the write lock (it needs read access itself)
+                let query_rows: Option<Vec<Vec<Value>>> = match query {
+                    Some(q) => match self.execute(q, params)? {
+                        StmtResult::Rows { rows, .. } => Some(rows),
+                        StmtResult::Tag(_) => {
+                            return Err(PqError::syntax(
+                                "INSERT query must return rows",
+                            ))
+                        }
+                    },
+                    None => None,
+                };
+                // ON CONFLICT SET exprs may embed scalar subqueries
+                let conflict_owned: Option<crate::sql::OnConflict> =
+                    match conflict {
+                        Some(oc) => {
+                            let o = match &oc.action {
+                                crate::sql::ConflictAction::Nothing => oc.clone(),
+                                crate::sql::ConflictAction::Update { sets, guard } => {
+                                    let new_sets: Vec<(String, Expr)> = sets
+                                        .iter()
+                                        .map(|(c, e)| {
+                                            Ok((
+                                                c.clone(),
+                                                self.rewrite_expr_subs(e, params)?,
+                                            ))
+                                        })
+                                        .collect::<R<_>>()?;
+                                    let new_guard = match guard {
+                                        Some(g) => Some(self.rewrite_expr_subs(g, params)?),
+                                        None => None,
+                                    };
+                                    crate::sql::OnConflict {
+                                        target: oc.target.clone(),
+                                        action: crate::sql::ConflictAction::Update {
+                                            sets: new_sets,
+                                            guard: new_guard,
+                                        },
+                                    }
+                                }
+                            };
+                            Some(o)
+                        }
+                        None => None,
+                    };
+                let conflict = &conflict_owned;
 
                 let mut t = self.tables.write().unwrap();
                 let tab = match t.get_mut(&table.name) {
@@ -1064,6 +1716,74 @@ impl Db {
                     None => return Err(PqError::undefined_table(&table.name)),
                 };
                 let ncols = tab.cols.len();
+                // ON CONFLICT arbiter column: exempted from the staging
+                // unique check — its conflicts are resolved by the clause.
+                // Resolved up front (analysis-time, like PG) so precedence
+                // of 0A000/42703/42P10 over staging 23505 matches PG.
+                let arb_col: Option<usize> = match conflict.as_ref() {
+                    None => None,
+                    Some(oc) => {
+                        if oc.target.len() > 1 {
+                            return Err(PqError::new(
+                                "0A000",
+                                "multi-column ON CONFLICT targets are not supported (puddle indexes are single-column)",
+                            ));
+                        }
+                        match oc.target.first() {
+                            Some(c) => {
+                                let p = tab
+                                    .cols
+                                    .iter()
+                                    .position(|cd| cd.name == *c)
+                                    .ok_or_else(|| {
+                                        PqError::new(
+                                            "42703",
+                                            format!(
+                                                "column \"{}\" of relation \"{}\" does not exist",
+                                                c, table.name
+                                            ),
+                                        )
+                                    })?;
+                                if !tab
+                                    .indexes
+                                    .values()
+                                    .any(|ix| ix.col == p && (ix.internal || ix.unique))
+                                {
+                                    return Err(PqError::new(
+                                        "42P10",
+                                        "there is no unique or exclusion constraint matching the ON CONFLICT specification",
+                                    ));
+                                }
+                                Some(p)
+                            }
+                            None => {
+                                // no target list: unambiguous iff exactly
+                                // one index exists and it enforces uniqueness
+                                let enforcing = tab
+                                    .indexes
+                                    .values()
+                                    .filter(|ix| ix.internal || ix.unique)
+                                    .count();
+                                if enforcing == 1
+                                    && tab.indexes.values().all(|ix| ix.internal || ix.unique)
+                                {
+                                    Some(
+                                        tab.indexes
+                                            .values()
+                                            .find(|ix| ix.internal || ix.unique)
+                                            .map(|ix| ix.col)
+                                            .unwrap_or(0),
+                                    )
+                                } else {
+                                    return Err(PqError::new(
+                                        "42P10",
+                                        "there is no unique or exclusion constraint matching the ON CONFLICT specification",
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                };
                 // explicit column list -> positions in the table
                 let colpos: Vec<usize> = if cols.is_empty() {
                     (0..ncols).collect()
@@ -1106,7 +1826,52 @@ impl Db {
                     params,
                 };
                 let mut staged = Vec::new();
+                let mut uq_pending: std::collections::HashSet<(String, IKey)> =
+                    std::collections::HashSet::new();
                 let mut inserted = Vec::new();
+                for row in query_rows.iter().flatten() {
+                    // INSERT ... SELECT: rows are already values; coerce
+                    // each to its target column type like PG
+                    if row.len() != colpos.len() {
+                        return Err(PqError::new(
+                            "42601",
+                            format!(
+                                "INSERT has {} expressions but targeted {} columns",
+                                row.len(), colpos.len()
+                            ),
+                        ));
+                    }
+                    let mut targeted = Vec::with_capacity(colpos.len());
+                    for (v, &p) in row.iter().zip(colpos.iter()) {
+                        let cdef = &tab.cols[p];
+                        let v = coerce(v.clone(), cdef.ty)?;
+                        if cdef.not_null && matches!(v, Value::Null) {
+                            return Err(PqError::new(
+                                "23502",
+                                format!(
+                                    "null value in column \"{}\" violates not-null constraint",
+                                    cdef.name
+                                ),
+                            ));
+                        }
+                        targeted.push((p, v));
+                    }
+                    let mut qvals: Vec<Value> = vec![Value::Null; ncols];
+                    for (p, v) in targeted {
+                        qvals[p] = v;
+                    }
+                    Self::fill_defaults(tab, &colpos, &mut qvals, params)?;
+                    Self::check_row_constraints(
+                        tab,
+                        &table.name,
+                        &qvals,
+                        None,
+                        &mut uq_pending,
+                        params,
+                        arb_col,
+                    )?;
+                    staged.push(qvals);
+                }
                 for row in rows {
                     if row.len() != colpos.len() {
                         return Err(PqError::new(
@@ -1144,24 +1909,172 @@ impl Db {
                     for (p, v) in targeted {
                         vals[p] = v;
                     }
-                    // columns left out must tolerate NULL
-                    for (i, cdef) in tab.cols.iter().enumerate() {
-                        if cdef.not_null && matches!(vals[i], Value::Null) && !colpos.contains(&i) {
+                    Self::fill_defaults(tab, &colpos, &mut vals, params)?;
+                    Self::check_row_constraints(
+                        tab,
+                        &table.name,
+                        &vals,
+                        None,
+                        &mut uq_pending,
+                        params,
+                        arb_col,
+                    )?;
+                    staged.push(vals);
+                }
+                // ---- ON CONFLICT: partition staged rows into fresh
+                // inserts and conflicts (skip or update), then apply both
+                // in one atomic transaction ----
+                let mut fresh: Vec<Vec<Value>> = Vec::new();
+                let mut upd_plan: Vec<(usize, Vec<Value>)> = Vec::new(); // (pos, new cells)
+                if let Some(oc) = conflict {
+                    // resolve the arbiter index (puddle btree indexes are
+                    // single-column; PG's uniqueness requirement is
+                    // approximated by "an index must exist on the target
+                    // column" — uniqueness itself is not enforced)
+                    let (ix_col, _ix_name) = (|| {
+                        if oc.target.len() > 1 {
                             return Err(PqError::new(
-                                "23502",
-                                format!(
-                                    "null value in column \"{}\" violates not-null constraint",
-                                    cdef.name
-                                ),
+                                "0A000",
+                                "multi-column ON CONFLICT targets are not supported (puddle indexes are single-column)",
                             ));
                         }
+                        match oc.target.first() {
+                            Some(c) => {
+                                let p = tab
+                                    .cols
+                                    .iter()
+                                    .position(|cd| cd.name == *c)
+                                    .ok_or_else(|| {
+                                        PqError::new(
+                                            "42703",
+                                            format!(
+                                                "column \"{}\" of relation \"{}\" does not exist",
+                                                c, table.name
+                                            ),
+                                        )
+                                    })?;
+                                let name = tab
+                                    .indexes
+                                    .iter()
+                                    .find(|(_, ix)| ix.col == p && (ix.internal || ix.unique))
+                                    .map(|(n, _)| n.clone())
+                                    .ok_or_else(|| {
+                                        PqError::new(
+                                            "42P10",
+                                            "there is no unique or exclusion constraint matching the ON CONFLICT specification",
+                                        )
+                                    })?;
+                                Ok((p, name))
+                            }
+                            None => {
+                                // no target list: unambiguous iff exactly
+                                // one unique-enforcing index exists
+                                if tab
+                                    .indexes
+                                    .values()
+                                    .filter(|ix| ix.internal || ix.unique)
+                                    .count()
+                                    == 1
+                                    && tab.indexes.values().all(|ix| ix.internal || ix.unique)
+                                {
+                                    let (n, ix) = tab.indexes.iter().next().unwrap();
+                                    Ok((ix.col, n.clone()))
+                                } else {
+                                    Err(PqError::new(
+                                        "42P10",
+                                        "there is no unique or exclusion constraint matching the ON CONFLICT specification",
+                                    ))
+                                }
+                            }
+                        }
+                    })()?;
+                    // scope for DO UPDATE: the existing row plus the
+                    // proposed row under the `excluded` alias
+                    let mut cscope = Scope::empty();
+                    cscope.push(
+                        table.effective_name(),
+                        tab.cols.iter().map(|c| (c.name.clone(), c.ty)).collect(),
+                    );
+                    cscope.push(
+                        "excluded",
+                        tab.cols.iter().map(|c| (c.name.clone(), c.ty)).collect(),
+                    );
+                    let mut affected: std::collections::HashSet<IKey> =
+                        std::collections::HashSet::new();
+                    for cells in staged.into_iter() {
+                        let key = IKey::of(&cells[ix_col]);
+                        let hit_rowid = key.as_ref().and_then(|k| {
+                            tab.indexes
+                                .values()
+                                .find(|ix| ix.col == ix_col)
+                                .and_then(|ix| ix.lookup(k).first().copied())
+                        });
+                        if let (Some(k), Some(rowid)) = (key, hit_rowid) {
+                            if !affected.insert(k) {
+                                return Err(PqError::new(
+                                    "21000",
+                                    "ON CONFLICT DO UPDATE command cannot affect row a second time",
+                                ));
+                            }
+                            let pos = match tab.rowids.binary_search(&rowid) {
+                                Ok(p) => p,
+                                Err(_) => tab
+                                    .rowids
+                                    .iter()
+                                    .position(|&r| r == rowid)
+                                    .unwrap_or(usize::MAX),
+                            };
+                            match &oc.action {
+                                crate::sql::ConflictAction::Nothing => {
+                                    continue; // skip silently
+                                }
+                                crate::sql::ConflictAction::Update { sets, guard } => {
+                                    let existing = tab.row(pos);
+                                    let mut combined = existing.clone();
+                                    combined.extend(cells.iter().cloned());
+                                    let cctx = Ctx {
+                                        scope: &cscope,
+                                        row: &combined,
+                                        aggs: &[],
+                                        params,
+                                    };
+                                    if let Some(g) = guard {
+                                        if !matches!(eval(g, &cctx)?, Value::Bool(true)) {
+                                            continue;
+                                        }
+                                    }
+                                    let mut new_row = existing.clone();
+                                    for (c, e) in sets {
+                                        let p = tab
+                                            .cols
+                                            .iter()
+                                            .position(|cd| cd.name == *c)
+                                            .ok_or_else(|| {
+                                                PqError::new(
+                                                    "42703",
+                                                    format!(
+                                                        "column \"{}\" of relation \"{}\" does not exist",
+                                                        c, table.name
+                                                    ),
+                                                )
+                                            })?;
+                                        let cdef = &tab.cols[p];
+                                        new_row[p] = coerce(eval(e, &cctx)?, cdef.ty)?;
+                                    }
+                                    upd_plan.push((pos, new_row));
+                                }
+                            }
+                            continue;
+                        }
+                        fresh.push(cells);
                     }
-                    staged.push(vals);
+                } else {
+                    fresh = staged;
                 }
                 // statement is atomic: nothing is logged or inserted until
                 // every row evaluated successfully
                 let base = tab.next_rowid;
-                let recs: Vec<WalRec> = staged
+                let mut recs: Vec<WalRec> = fresh
                     .iter()
                     .enumerate()
                     .map(|(i, cells)| WalRec::Insert {
@@ -1169,8 +2082,12 @@ impl Db {
                         cells: cells.clone(),
                     })
                     .collect();
+                recs.extend(upd_plan.iter().map(|(pos, cells)| WalRec::Update {
+                    rowid: tab.rowids[*pos],
+                    cells: cells.clone(),
+                }));
                 self.log_txn(&[(table.name.clone(), recs)])?;
-                for cells in staged {
+                for cells in fresh {
                     let id = tab.next_rowid;
                     tab.next_rowid += 1;
                     // secondary index maintenance (non-null keys only)
@@ -1181,6 +2098,27 @@ impl Db {
                     }
                     tab.push_row(id, cells.clone());
                     inserted.push(cells);
+                }
+                for (pos, cells) in upd_plan {
+                    let rowid = tab.rowids[pos];
+                    // secondary index maintenance for changed columns
+                    for ix in tab.indexes.values_mut() {
+                        let c = ix.col;
+                        let old_k = IKey::of(&tab.columns[c][pos]);
+                        let new_k = IKey::of(&cells[c]);
+                        if old_k != new_k {
+                            if let Some(k) = &old_k {
+                                ix.remove(k, rowid);
+                            }
+                            if let Some(k) = &new_k {
+                                ix.insert(k, rowid);
+                            }
+                        }
+                    }
+                    for (c, v) in cells.into_iter().enumerate() {
+                        tab.columns[c][pos] = v;
+                    }
+                    inserted.push(tab.row(pos));
                 }
                 let n = inserted.len();
                 if n > 0 {
@@ -1214,6 +2152,17 @@ impl Db {
                         "AS OF is not allowed on a UPDATE target",
                     ));
                 }
+                // scalar subqueries in WHERE/SET rewrite to literals before
+                // execution (same rule as SELECT; uncorrelated only)
+                let where_ = match where_ {
+                    Some(w) => Some(self.rewrite_expr_subs(w, params)?),
+                    None => None,
+                };
+                let sets_owned: Vec<(String, Expr)> = sets
+                    .iter()
+                    .map(|(c, e)| Ok((c.clone(), self.rewrite_expr_subs(e, params)?)))
+                    .collect::<R<_>>()?;
+                let sets = &sets_owned;
 
                 let mut t = self.tables.write().unwrap();
                 let tab = match t.get_mut(&table.name) {
@@ -1230,7 +2179,7 @@ impl Db {
                     .iter()
                     .map(|c| (c.name.clone(), c.not_null))
                     .collect();
-                if let Some(w) = where_ {
+                if let Some(w) = &where_ {
                     if w.has_agg() {
                         return Err(PqError::new(
                             "42803",
@@ -1241,7 +2190,15 @@ impl Db {
                 let mut updated = Vec::new();
                 let mut n = 0usize;
                 let mut plan: Vec<(usize, Vec<Value>)> = Vec::new();
-                for i in 0..tab.nrows() {
+                let mut uq_pending: std::collections::HashSet<(String, IKey)> =
+                    std::collections::HashSet::new();
+                // secondary-index prefilter (pure pruner: the WHERE still
+                // runs on every candidate, so results can never change —
+                // a point UPDATE on an indexed column skips the full scan)
+                let candidates = index_prefilter(where_.as_ref(), tab, &scope, params);
+                let scan: Vec<usize> =
+                    candidates.unwrap_or_else(|| (0..tab.nrows()).collect());
+                for i in scan {
                     let row = tab.row(i);
                     let ctx = Ctx {
                         scope: &scope,
@@ -1249,7 +2206,7 @@ impl Db {
                         aggs: &[],
                         params,
                     };
-                    let matches = match where_ {
+                    let matches = match &where_ {
                         Some(w) => matches!(eval(w, &ctx)?, Value::Bool(true)),
                         None => true,
                     };
@@ -1275,6 +2232,17 @@ impl Db {
                         }
                         new_row[idx] = v;
                     }
+                    // CHECK / UNIQUE constraints apply to the updated row
+                    // (the unique probe excludes the row's own rowid)
+                    Self::check_row_constraints(
+                        tab,
+                        &table.name,
+                        &new_row,
+                        Some(tab.rowids[i]),
+                        &mut uq_pending,
+                        params,
+                        None,
+                    )?;
                     plan.push((i, new_row.clone()));
                     updated.push(new_row);
                     n += 1;
@@ -1334,6 +2302,12 @@ impl Db {
                         "AS OF is not allowed on a DELETE target",
                     ));
                 }
+                // scalar subqueries in WHERE rewrite to literals before
+                // execution (same rule as SELECT; uncorrelated only)
+                let where_ = match where_ {
+                    Some(w) => Some(self.rewrite_expr_subs(w, params)?),
+                    None => None,
+                };
 
                 let mut t = self.tables.write().unwrap();
                 let tab = match t.get_mut(&table.name) {
@@ -1345,7 +2319,7 @@ impl Db {
                     table.effective_name(),
                     tab.cols.iter().map(|c| (c.name.clone(), c.ty)).collect(),
                 );
-                if let Some(w) = where_ {
+                if let Some(w) = &where_ {
                     if w.has_agg() {
                         return Err(PqError::new(
                             "42803",
@@ -1354,8 +2328,13 @@ impl Db {
                     }
                 }
                 let mut deleted = Vec::new();
+                // same pure-pruner prefilter as UPDATE (indexed point
+                // DELETEs skip the full scan)
+                let candidates = index_prefilter(where_.as_ref(), tab, &scope, params);
+                let scan: Vec<usize> =
+                    candidates.unwrap_or_else(|| (0..tab.nrows()).collect());
                 let mut del_idx: Vec<usize> = Vec::new();
-                for i in 0..tab.nrows() {
+                for i in scan {
                     let row = tab.row(i);
                     let ctx = Ctx {
                         scope: &scope,
@@ -1363,7 +2342,7 @@ impl Db {
                         aggs: &[],
                         params,
                     };
-                    let matches = match where_ {
+                    let matches = match &where_ {
                         Some(w) => matches!(eval(w, &ctx)?, Value::Bool(true)),
                         None => true,
                     };
@@ -1505,6 +2484,133 @@ impl Db {
             Stmt::Commit => Ok(StmtResult::Tag("COMMIT".into())),
             Stmt::Rollback => Ok(StmtResult::Tag("ROLLBACK".into())),
             Stmt::Select(sel) => self.select(sel, params),
+            Stmt::Values {
+                rows,
+                order_by,
+                limit,
+                offset,
+            } => {
+                // evaluate every row (constants only — VALUES has no FROM)
+                let empty_scope = Scope::empty();
+                let ectx = Ctx {
+                    scope: &empty_scope,
+                    row: &[],
+                    aggs: &[],
+                    params,
+                };
+                let mut out: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
+                let mut width = None;
+                for r in rows {
+                    let mut vals = Vec::with_capacity(r.len());
+                    for ex in r {
+                        vals.push(eval(ex, &ectx)?);
+                    }
+                    match width {
+                        None => width = Some(vals.len()),
+                        Some(w) if w != vals.len() => {
+                            return Err(PqError::new(
+                                "42601",
+                                "VALUES lists must all be the same length",
+                            ))
+                        }
+                        _ => {}
+                    }
+                    out.push(vals);
+                }
+                let w = width.unwrap_or(0);
+                // PG column names: column1, column2, ...
+                let ty = |v: &Value| match v {
+                    Value::Int(_) => Ty::Int,
+                    Value::Float(_) => Ty::Float,
+                    Value::Bool(_) => Ty::Bool,
+                    Value::Text(_) => Ty::Text,
+                    _ => Ty::Text,
+                };
+                let cols: Vec<(String, Ty)> = (0..w)
+                    .map(|i| {
+                        let t = out.first().map(|r| ty(&r[i])).unwrap_or(Ty::Text);
+                        (format!("column{}", i + 1), t)
+                    })
+                    .collect();
+                // ORDER BY (positional ints or columnN names)
+                let mut rows = out;
+                if !order_by.is_empty() {
+                    let mut idx: Vec<usize> = (0..rows.len()).collect();
+                    let keys: Vec<Vec<Value>> = rows
+                        .iter()
+                        .map(|r| {
+                            order_by
+                                .iter()
+                                .map(|(ex, _, _)| match ex {
+                                    Expr::Lit(Value::Int(n))
+                                        if *n >= 1 && (*n as usize) <= r.len() =>
+                                    {
+                                        r[(*n - 1) as usize].clone()
+                                    }
+                                    Expr::Col(c) => {
+                                        if let Some(p) = cols.iter().position(|(n, _)| n == c) {
+                                            r[p].clone()
+                                        } else {
+                                            Value::Null
+                                        }
+                                    }
+                                    _ => Value::Null,
+                                })
+                                .collect()
+                        })
+                        .collect();
+                    let descs: Vec<(bool, bool)> =
+                        order_by.iter().map(|(_, d, n)| (*d, *n)).collect();
+                    idx.sort_by(|&a, &b| {
+                        for (i, (desc, nf)) in descs.iter().enumerate() {
+                            match order_cmp(&keys[a][i], &keys[b][i], *desc, *nf) {
+                                Ok(std::cmp::Ordering::Equal) => continue,
+                                Ok(o) => return o,
+                                Err(_) => return std::cmp::Ordering::Equal,
+                            }
+                        }
+                        std::cmp::Ordering::Equal
+                    });
+                    rows = idx.into_iter().map(|i| rows[i].clone()).collect();
+                }
+                // OFFSET / LIMIT
+                let mut start = 0usize;
+                if let Some(o) = offset {
+                    match eval(o, &ectx)? {
+                        Value::Int(n) if n >= 0 => start = n as usize,
+                        Value::Float(f) if f >= 0.0 => start = f as usize,
+                        Value::Null => {}
+                        v => {
+                            return Err(PqError::wrong_type(format!(
+                                "OFFSET must be an integer, got {}",
+                                type_name(&v)
+                            )))
+                        }
+                    }
+                }
+                if start > rows.len() {
+                    start = rows.len();
+                }
+                rows.drain(..start);
+                if let Some(l) = limit {
+                    match eval(l, &ectx)? {
+                        Value::Int(n) if n >= 0 => rows.truncate(n as usize),
+                        Value::Float(f) if f >= 0.0 => rows.truncate(f as usize),
+                        Value::Null => {}
+                        v => {
+                            return Err(PqError::wrong_type(format!(
+                                "LIMIT must be an integer, got {}",
+                                type_name(&v)
+                            )))
+                        }
+                    }
+                }
+                Ok(StmtResult::Rows {
+                    cols,
+                    rows,
+                    tag: "SELECT".into(),
+                })
+            }
             Stmt::Union {
                 arms,
                 all,
@@ -1519,7 +2625,7 @@ impl Db {
                         cols: c,
                         rows: r,
                         ..
-                    } = self.select(arm, params)?
+                    } = self.execute(arm, params)?
                     {
                         if cols.is_none() {
                             cols = Some(c);
@@ -1628,7 +2734,12 @@ impl Db {
     fn has_subquery(sel: &SelectStmt) -> bool {
         fn walk(e: &Expr) -> bool {
             match e {
-                Expr::Subquery(_) => true,
+                Expr::Subquery(_) | Expr::InSub(..) => true,
+                Expr::Win { args, spec, .. } => {
+                    args.iter().any(walk)
+                        || spec.partition_by.iter().any(walk)
+                        || spec.order_by.iter().any(|(e, _, _)| walk(e))
+                }
                 Expr::Neg(a) | Expr::Not(a) | Expr::IsNull(a, _) | Expr::Cast(a, _) => walk(a),
                 Expr::Like(a, b, _) | Expr::Between(a, b, _, _) => walk(a) || walk(b),
                 Expr::InList(a, l, _) => walk(a) || l.iter().any(walk),
@@ -1643,7 +2754,7 @@ impl Db {
                         || else_.as_ref().is_some_and(|e| walk(e))
                 }
                 Expr::Func(_, args) => args.iter().any(walk),
-                Expr::Agg(_, a, _) => walk(a),
+                Expr::Agg(_, a, _, _) => walk(a),
                 _ => false,
             }
         }
@@ -1662,7 +2773,12 @@ impl Db {
     fn items_have_subquery(sel: &SelectStmt) -> bool {
         fn walk(e: &Expr) -> bool {
             match e {
-                Expr::Subquery(_) => true,
+                Expr::Subquery(_) | Expr::InSub(..) => true,
+                Expr::Win { args, spec, .. } => {
+                    args.iter().any(walk)
+                        || spec.partition_by.iter().any(walk)
+                        || spec.order_by.iter().any(|(e, _, _)| walk(e))
+                }
                 Expr::Neg(a) | Expr::Not(a) | Expr::IsNull(a, _) | Expr::Cast(a, _) => walk(a),
                 Expr::Like(a, b, _) | Expr::Between(a, b, _, _) => walk(a) || walk(b),
                 Expr::InList(a, l, _) => walk(a) || l.iter().any(walk),
@@ -1677,7 +2793,7 @@ impl Db {
                         || else_.as_ref().is_some_and(|x| walk(x))
                 }
                 Expr::Func(_, args) => args.iter().any(walk),
-                Expr::Agg(_, a, _) => walk(a),
+                Expr::Agg(_, a, _, _) => walk(a),
                 _ => false,
             }
         }
@@ -1796,13 +2912,754 @@ impl Db {
                     .map(|a| self.rewrite_expr_subs(a, params))
                     .collect::<R<Vec<_>>>()?,
             ),
-            Expr::Agg(k, a, d) => {
-                Expr::Agg(*k, Box::new(self.rewrite_expr_subs(a, params)?), *d)
+            Expr::Agg(k, a, d, f) => {
+                Expr::Agg(
+                    *k,
+                    Box::new(self.rewrite_expr_subs(a, params)?),
+                    *d,
+                    match f {
+                        Some(fe) => Some(Box::new(self.rewrite_expr_subs(fe, params)?)),
+                        None => None,
+                    },
+                )
+            }
+            Expr::Win { kind, args, spec, filter } => {
+                let mut new_args = Vec::with_capacity(args.len());
+                for a in args {
+                    new_args.push(self.rewrite_expr_subs(a, params)?);
+                }
+                let mut new_pb = Vec::with_capacity(spec.partition_by.len());
+                for a in &spec.partition_by {
+                    new_pb.push(self.rewrite_expr_subs(a, params)?);
+                }
+                let mut new_ob = Vec::with_capacity(spec.order_by.len());
+                for (e, d, nf) in &spec.order_by {
+                    new_ob.push((self.rewrite_expr_subs(e, params)?, *d, *nf));
+                }
+                Expr::Win {
+                    kind: kind.clone(),
+                    args: new_args,
+                    spec: Box::new(crate::sql::WindowSpec {
+                        name: None, // names are resolved before param binding
+                        partition_by: new_pb,
+                        order_by: new_ob,
+                        frame: spec.frame.clone(),
+                    }),
+                    filter: match filter {
+                        Some(fe) => Some(Box::new(self.rewrite_expr_subs(fe, params)?)),
+                        None => None,
+                    },
+                }
+            }
+            Expr::InSub(a, sub, n) => {
+                // uncorrelated IN-subquery: evaluate once, lower to a
+                // literal InList (PG allows correlated IN; puddle does
+                // not — same standing limitation as scalar subqueries)
+                let res = self.execute(&Stmt::Select((**sub).clone()), params)?;
+                let rows = match res {
+                    StmtResult::Rows { rows, cols, .. } => {
+                        if cols.len() != 1 {
+                            return Err(PqError::new(
+                                "42601",
+                                format!(
+                                    "subquery has too many columns ({} for IN)",
+                                    cols.len()
+                                ),
+                            ));
+                        }
+                        rows
+                    }
+                    StmtResult::Tag(_) => Vec::new(),
+                };
+                let list: Vec<Expr> = rows
+                    .into_iter()
+                    .map(|r| Expr::Lit(r.into_iter().next().unwrap_or(Value::Null)))
+                    .collect();
+                Expr::InList(
+                    Box::new(self.rewrite_expr_subs(a, params)?),
+                    list,
+                    *n,
+                )
             }
         })
     }
 
+    // -------------------------------------------------- window functions --
+    /// Collects the distinct window calls of a query (items + ORDER BY),
+    /// in first-appearance order.
+    fn collect_wins(sel: &SelectStmt) -> Vec<Expr> {
+        fn walk(e: &Expr, out: &mut Vec<Expr>) {
+            match e {
+                Expr::Win { .. } => {
+                    if !out.contains(e) {
+                        out.push(e.clone());
+                    }
+                }
+                Expr::Neg(a) | Expr::Not(a) | Expr::IsNull(a, _) | Expr::Cast(a, _) => walk(a, out),
+                Expr::Like(a, b, _) | Expr::Between(a, b, _, _) => {
+                    walk(a, out);
+                    walk(b, out);
+                }
+                Expr::InList(a, l, _) => {
+                    walk(a, out);
+                    for x in l {
+                        walk(x, out);
+                    }
+                }
+                Expr::InSub(a, _, _) => walk(a, out),
+                Expr::Bin(a, _, b) => {
+                    walk(a, out);
+                    walk(b, out);
+                }
+                Expr::Case {
+                    operand,
+                    when_then,
+                    else_,
+                } => {
+                    if let Some(o) = operand {
+                        walk(o, out);
+                    }
+                    for (w, t) in when_then {
+                        walk(w, out);
+                        walk(t, out);
+                    }
+                    if let Some(x) = else_ {
+                        walk(x, out);
+                    }
+                }
+                Expr::Func(_, args) => {
+                    for a in args {
+                        walk(a, out);
+                    }
+                }
+                Expr::Agg(_, a, _, _) => walk(a, out),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for i in &sel.items {
+            if let SelectItem::Expr(e, _) = i {
+                walk(e, &mut out);
+            }
+        }
+        for (e, _, _) in &sel.order_by {
+            walk(e, &mut out);
+        }
+        out
+    }
+
+    /// Resolves OVER w / OVER (w ...) references against the statement's
+    /// WINDOW clause, merging specs (PG rules: the derived spec may add
+    /// ORDER BY only if the base has none; PARTITION BY cannot be
+    /// re-specified; frame may be set). Returns a SelectStmt whose window
+    /// specs are all inline (name: None).
+    fn resolve_window_refs(
+        e: &Expr,
+        windows: &[(String, crate::sql::WindowSpec)],
+    ) -> R<Expr> {
+        let rw = |a: &Expr| -> R<Expr> { Self::resolve_window_refs(a, windows) };
+        match e {
+            Expr::Win { kind, args, spec, filter } => {
+                let (name, partition_by, order_by, frame) = match &spec.name {
+                    None => (
+                        None,
+                        spec.partition_by.clone(),
+                        spec.order_by.clone(),
+                        spec.frame.clone(),
+                    ),
+                    Some(n) => {
+                        let base = match windows.iter().find(|(wn, _)| wn == n) {
+                            Some((_, b)) => b,
+                            None => {
+                                return Err(PqError::new(
+                                    "42704",
+                                    format!("window \"{}\" does not exist", n),
+                                ))
+                            }
+                        };
+                        if !spec.partition_by.is_empty() {
+                            return Err(PqError::new(
+                                "42P10",
+                                "PARTITION BY cannot be re-specified in an inherited window",
+                            ));
+                        }
+                        if !spec.order_by.is_empty() && !base.order_by.is_empty() {
+                            return Err(PqError::new(
+                                "42P10",
+                                format!(
+                                    "cannot override ORDER BY clause of window \"{}\"",
+                                    n
+                                ),
+                            ));
+                        }
+                        (
+                            None,
+                            base.partition_by.clone(),
+                            if spec.order_by.is_empty() {
+                                base.order_by.clone()
+                            } else {
+                                spec.order_by.clone()
+                            },
+                            spec.frame.clone().or(base.frame.clone()),
+                        )
+                    }
+                };
+                Ok(Expr::Win {
+                    kind: kind.clone(),
+                    args: args.iter().map(&rw).collect::<R<Vec<_>>>()?,
+                    spec: Box::new(crate::sql::WindowSpec {
+                        name,
+                        partition_by: partition_by.iter().map(&rw).collect::<R<Vec<_>>>()?,
+                        order_by: order_by
+                            .iter()
+                            .map(|(ex, d, nf)| Ok((rw(ex)?, *d, *nf)))
+                            .collect::<R<Vec<_>>>()?,
+                        frame,
+                    }),
+                    filter: match filter {
+                        Some(f) => Some(Box::new(rw(f)?)),
+                        None => None,
+                    },
+                })
+            }
+            Expr::Lit(_) | Expr::Col(_) | Expr::QCol(..) | Expr::Param(_) | Expr::AggRef(_)
+            | Expr::Subquery(_) | Expr::Agg(..) => Ok(e.clone()),
+            Expr::Neg(a) => Ok(Expr::Neg(Box::new(rw(a)?))),
+            Expr::Not(a) => Ok(Expr::Not(Box::new(rw(a)?))),
+            Expr::IsNull(a, n) => Ok(Expr::IsNull(Box::new(rw(a)?), *n)),
+            Expr::Cast(a, t) => Ok(Expr::Cast(Box::new(rw(a)?), *t)),
+            Expr::Like(a, b, n) => Ok(Expr::Like(
+                Box::new(rw(a)?),
+                Box::new(rw(b)?),
+                *n,
+            )),
+            Expr::Between(a, lo, hi, n) => Ok(Expr::Between(
+                Box::new(rw(a)?),
+                Box::new(rw(lo)?),
+                Box::new(rw(hi)?),
+                *n,
+            )),
+            Expr::InList(a, l, n) => Ok(Expr::InList(
+                Box::new(rw(a)?),
+                l.iter().map(&rw).collect::<R<Vec<_>>>()?,
+                *n,
+            )),
+            Expr::InSub(a, sub, n) => Ok(Expr::InSub(
+                Box::new(rw(a)?),
+                sub.clone(),
+                *n,
+            )),
+            Expr::Bin(a, op, b) => Ok(Expr::Bin(
+                Box::new(rw(a)?),
+                op,
+                Box::new(rw(b)?),
+            )),
+            Expr::Case {
+                operand,
+                when_then,
+                else_,
+            } => Ok(Expr::Case {
+                operand: match operand { Some(o) => Some(Box::new(rw(o)?)), None => None },
+                when_then: when_then
+                    .iter()
+                    .map(|(w, t)| Ok((rw(w)?, rw(t)?)))
+                    .collect::<R<Vec<_>>>()?,
+                else_: match else_ { Some(o) => Some(Box::new(rw(o)?)), None => None },
+            }),
+            Expr::Func(f, args) => Ok(Expr::Func(
+                f.clone(),
+                args.iter().map(&rw).collect::<R<Vec<_>>>()?,
+            )),
+        }
+    }
+
+    /// Resolves every OVER w in a select against its WINDOW clause.
+    fn resolve_sel_windows(sel: &SelectStmt) -> R<SelectStmt> {
+        let mut out = sel.clone();
+        for it in out.items.iter_mut() {
+            if let SelectItem::Expr(e, _) = it {
+                *e = Self::resolve_window_refs(e, &sel.windows)?;
+            }
+        }
+        for (e, _, _) in out.order_by.iter_mut() {
+            *e = Self::resolve_window_refs(e, &sel.windows)?;
+        }
+        Ok(out)
+    }
+
+    /// Replaces every window call matching entry k of `wins` with
+    /// Col("__win_k").
+    fn replace_wins(e: &Expr, wins: &[Expr]) -> Expr {
+        if let Expr::Win { .. } = e {
+            if let Some(k) = wins.iter().position(|w| w == e) {
+                return Expr::Col(format!("__win_{}", k));
+            }
+        }
+        match e {
+            Expr::Lit(_) | Expr::Col(_) | Expr::QCol(..) | Expr::Param(_) | Expr::AggRef(_)
+            | Expr::Subquery(_) | Expr::Agg(..) => e.clone(),
+            Expr::Neg(a) => Expr::Neg(Box::new(Self::replace_wins(a, wins))),
+            Expr::Not(a) => Expr::Not(Box::new(Self::replace_wins(a, wins))),
+            Expr::IsNull(a, n) => Expr::IsNull(Box::new(Self::replace_wins(a, wins)), *n),
+            Expr::Cast(a, t) => Expr::Cast(Box::new(Self::replace_wins(a, wins)), *t),
+            Expr::Like(a, b, n) => Expr::Like(
+                Box::new(Self::replace_wins(a, wins)),
+                Box::new(Self::replace_wins(b, wins)),
+                *n,
+            ),
+            Expr::Between(a, lo, hi, n) => Expr::Between(
+                Box::new(Self::replace_wins(a, wins)),
+                Box::new(Self::replace_wins(lo, wins)),
+                Box::new(Self::replace_wins(hi, wins)),
+                *n,
+            ),
+            Expr::InList(a, l, n) => Expr::InList(
+                Box::new(Self::replace_wins(a, wins)),
+                l.iter().map(|x| Self::replace_wins(x, wins)).collect(),
+                *n,
+            ),
+            Expr::InSub(a, sub, n) => {
+                Expr::InSub(Box::new(Self::replace_wins(a, wins)), sub.clone(), *n)
+            }
+            Expr::Bin(a, op, b) => Expr::Bin(
+                Box::new(Self::replace_wins(a, wins)),
+                op,
+                Box::new(Self::replace_wins(b, wins)),
+            ),
+            Expr::Case {
+                operand,
+                when_then,
+                else_,
+            } => Expr::Case {
+                operand: operand.as_ref().map(|o| Box::new(Self::replace_wins(o, wins))),
+                when_then: when_then
+                    .iter()
+                    .map(|(w, t)| (Self::replace_wins(w, wins), Self::replace_wins(t, wins)))
+                    .collect(),
+                else_: else_.as_ref().map(|o| Box::new(Self::replace_wins(o, wins))),
+            },
+            Expr::Func(f, args) => Expr::Func(
+                f.clone(),
+                args.iter().map(|a| Self::replace_wins(a, wins)).collect(),
+            ),
+            // a window call not in the collected list passes through
+            // (collect_wins walks every reachable expression, so this is
+            // defensive only)
+            Expr::Win { .. } => e.clone(),
+        }
+    }
+
+    /// Evaluates one window call over the pre-computed per-row keys/args
+    /// (pure values — no execution context). Returns one value per row.
+    fn win_eval(
+        kind: &crate::sql::WinKind,
+        frame: &Option<crate::sql::Frame>,
+        order_descs: &[(bool, bool)],
+        pkeys: &[Vec<Value>],
+        okeys: &[Vec<Value>],
+        args: &[Vec<Value>],
+        flags: &[bool],
+    ) -> R<Vec<Value>> {
+        use crate::sql::{FrameBound, WinKind};
+        let n = pkeys.len();
+        let mut out = vec![Value::Null; n];
+        // partition rows: first-seen order, gkey grouping
+        let mut index: HashMap<Vec<GK>, usize> = HashMap::new();
+        let mut parts: Vec<Vec<usize>> = Vec::new();
+        for (i, pk) in pkeys.iter().enumerate() {
+            let key: Vec<GK> = pk.iter().map(gkey).collect();
+            let pi = *index.entry(key).or_insert_with(|| {
+                parts.push(Vec::new());
+                parts.len() - 1
+            });
+            parts[pi].push(i);
+        }
+        for idxs in &parts {
+            // sort the partition by the ORDER BY keys (stable, with
+            // desc/nulls handling; ties keep original row order)
+            let mut sorted = idxs.clone();
+            if !okeys.is_empty() || !order_descs.is_empty() {
+                sorted.sort_by(|&a, &b| {
+                    for (c, (desc, nf)) in order_descs.iter().enumerate() {
+                        match order_cmp(&okeys[a][c], &okeys[b][c], *desc, *nf) {
+                            Ok(std::cmp::Ordering::Equal) => continue,
+                            Ok(o) => return o,
+                            Err(_) => return std::cmp::Ordering::Equal,
+                        }
+                    }
+                    std::cmp::Ordering::Equal
+                });
+            }
+            let plen = sorted.len();
+            // peer groups (rows equal on ALL order keys) — needed by
+            // rank/dense_rank/cume_dist and RANGE frames
+            let mut peer_start: Vec<usize> = vec![0; plen];
+            let mut peer_end: Vec<usize> = vec![plen; plen];
+            if !okeys.is_empty() {
+                let eq = |a: usize, b: usize| -> bool {
+                    okeys[a]
+                        .iter()
+                        .zip(okeys[b].iter())
+                        .all(|(x, y)| matches!(compare(x, y), Ok(Some(0))))
+                };
+                let mut i = 0;
+                while i < plen {
+                    let mut j = i + 1;
+                    while j < plen && eq(sorted[i], sorted[j]) {
+                        j += 1;
+                    }
+                    for k in i..j {
+                        peer_start[k] = i;
+                        peer_end[k] = j;
+                    }
+                    i = j;
+                }
+            }
+            // frame start/end per position (as index ranges into `sorted`)
+            let default_frame = crate::sql::Frame {
+                rows: false,
+                start: FrameBound::UnboundedPreceding,
+                end: FrameBound::CurrentRow,
+            };
+            let fr = frame.as_ref().unwrap_or(&default_frame);
+            let frame_range = |pos: usize| -> (usize, usize) {
+                let (mut lo, mut hi) = (0usize, plen);
+                match fr.start {
+                    FrameBound::UnboundedPreceding => {}
+                    FrameBound::Preceding(off) => {
+                        lo = pos.saturating_sub(off as usize);
+                    }
+                    FrameBound::CurrentRow => {
+                        if fr.rows {
+                            lo = pos;
+                        } else {
+                            lo = peer_start[pos]; // RANGE: include peers
+                        }
+                    }
+                    FrameBound::Following(off) => {
+                        lo = (pos + off as usize).min(plen);
+                    }
+                    FrameBound::UnboundedFollowing => lo = plen,
+                }
+                match fr.end {
+                    FrameBound::UnboundedPreceding => hi = 0,
+                    FrameBound::Preceding(off) => {
+                        hi = pos.saturating_sub(off as usize);
+                    }
+                    FrameBound::CurrentRow => {
+                        if fr.rows {
+                            hi = pos + 1;
+                        } else {
+                            hi = peer_end[pos]; // RANGE: include peers
+                        }
+                    }
+                    FrameBound::Following(off) => {
+                        hi = (pos + 1 + off as usize).min(plen);
+                    }
+                    FrameBound::UnboundedFollowing => {}
+                }
+                (lo, hi.max(lo))
+            };
+            match kind {
+                WinKind::RowNumber => {
+                    for (pos, &i) in sorted.iter().enumerate() {
+                        out[i] = Value::Int(pos as i64 + 1);
+                    }
+                }
+                WinKind::Rank => {
+                    for pos in 0..plen {
+                        let r = peer_start[pos] + 1;
+                        out[sorted[pos]] = Value::Int(r as i64);
+                    }
+                }
+                WinKind::DenseRank => {
+                    for pos in 0..plen {
+                        // dense rank = number of distinct peer groups up to
+                        // and including this row's group
+                        let mut d = 0;
+                        let mut k = 0;
+                        while k <= pos {
+                            d += 1;
+                            k = peer_end[k];
+                        }
+                        out[sorted[pos]] = Value::Int(d as i64);
+                    }
+                }
+                WinKind::PercentRank => {
+                    for pos in 0..plen {
+                        let denom = (plen as i64 - 1).max(1);
+                        out[sorted[pos]] =
+                            Value::Float((peer_start[pos] as i64) as f64 / denom as f64);
+                    }
+                }
+                WinKind::CumeDist => {
+                    for pos in 0..plen {
+                        out[sorted[pos]] = Value::Float(peer_end[pos] as f64 / plen as f64);
+                    }
+                }
+                WinKind::Ntile => {
+                    // args[0] = bucket count (const; validated by caller)
+                    let buckets = match args.first().and_then(|a| a.first()) {
+                        Some(Value::Int(b)) if *b > 0 => *b as usize,
+                        _ => {
+                            return Err(PqError::syntax(
+                                "ntile() requires a positive integer argument",
+                            ))
+                        }
+                    };
+                    let base = plen / buckets;
+                    let rem = plen % buckets;
+                    let mut pos = 0;
+                    for b in 0..buckets {
+                        let size = base + if b < rem { 1 } else { 0 };
+                        for _ in 0..size {
+                            if pos < plen {
+                                out[sorted[pos]] = Value::Int(b as i64 + 1);
+                                pos += 1;
+                            }
+                        }
+                    }
+                }
+                WinKind::Lag | WinKind::Lead => {
+                    let lead = matches!(kind, WinKind::Lead);
+                    // offset and default are constants: read them from the
+                    // first row's argument vector (arg 1 = offset, arg 2 =
+                    // default), not from per-row argument slots
+                    let arg0 = args.first().cloned().unwrap_or_default();
+                    let off = match arg0.get(1) {
+                        Some(Value::Int(o)) if *o >= 0 => *o as usize,
+                        _ => 1,
+                    };
+                    let default_val = arg0.get(2).cloned().unwrap_or(Value::Null);
+                    for pos in 0..plen {
+                        let src = if lead {
+                            pos.checked_add(off)
+                        } else {
+                            pos.checked_sub(off)
+                        };
+                        out[sorted[pos]] = match src {
+                            Some(sp) if sp < plen => {
+                                args[sorted[sp]][0].clone()
+                            }
+                            _ => default_val.clone(),
+                        };
+                    }
+                }
+                WinKind::FirstValue | WinKind::LastValue | WinKind::NthValue => {
+                    for pos in 0..plen {
+                        let (lo, hi) = frame_range(pos);
+                        let v = if lo >= hi {
+                            Value::Null
+                        } else {
+                            match kind {
+                                WinKind::FirstValue => args[sorted[lo]][0].clone(),
+                                WinKind::LastValue => args[sorted[hi - 1]][0].clone(),
+                                _ => {
+                                    let nth = match args
+                                        .first()
+                                        .and_then(|a| a.get(1))
+                                    {
+                                        Some(Value::Int(k)) if *k >= 1 => *k as usize,
+                                        _ => 1,
+                                    };
+                                    if nth >= 1 && lo + nth - 1 < hi {
+                                        args[sorted[lo + nth - 1]][0].clone()
+                                    } else {
+                                        Value::Null
+                                    }
+                                }
+                            }
+                        };
+                        out[sorted[pos]] = v;
+                    }
+                }
+                WinKind::Agg(ak) => {
+                    // aggregates over the frame slice; prefix-sum fast
+                    // path for the common cumulative frame
+                    let cumulative_start = matches!(fr.start, FrameBound::UnboundedPreceding);
+                    let simple_end = matches!(
+                        fr.end,
+                        FrameBound::CurrentRow | FrameBound::UnboundedFollowing
+                    );
+                    if !fr.rows && cumulative_start && simple_end {
+                        // running aggregate over [0, peer_end) (or whole
+                        // partition for UNBOUNDED FOLLOWING)
+                        let mut acc: Vec<Value> = Vec::new();
+                        let mut count = 0i64;
+                        let mut cursor = 0usize;
+                        for pos in 0..plen {
+                            let end = match fr.end {
+                                FrameBound::UnboundedFollowing => plen,
+                                _ => peer_end[pos],
+                            };
+                            while cursor < end {
+                                let i = sorted[cursor];
+                                cursor += 1;
+                                if flags[i] {
+                                    acc.push(args[i][0].clone());
+                                    count += 1;
+                                }
+                            }
+                            out[sorted[pos]] = match ak {
+                                crate::engine::AggKind::CountStar
+                                | crate::engine::AggKind::Count => Value::Int(count),
+                                _ => {
+                                    let refs: Vec<&Value> = acc.iter().collect();
+                                    compute_agg_vals(
+                                        &AggSpec {
+                                            kind: *ak,
+                                            arg: Expr::Lit(Value::Int(1)),
+                                            distinct: false,
+                                            filter: None,
+                                        },
+                                        &refs,
+                                    )?
+                                }
+                            };
+                        }
+                    } else {
+                        for pos in 0..plen {
+                            let (lo, hi) = frame_range(pos);
+                            if lo >= hi {
+                                out[sorted[pos]] = match ak {
+                                    crate::engine::AggKind::CountStar
+                                    | crate::engine::AggKind::Count => Value::Int(0),
+                                    crate::engine::AggKind::Sum | crate::engine::AggKind::Avg => {
+                                        Value::Null
+                                    }
+                                    _ => Value::Null,
+                                };
+                                continue;
+                            }
+                            let vals: Vec<Value> = sorted[lo..hi]
+                                .iter()
+                                .filter(|&&i| flags[i])
+                                .map(|&i| args[i][0].clone())
+                                .collect();
+                            let refs: Vec<&Value> = vals.iter().collect();
+                            out[sorted[pos]] = compute_agg_vals(
+                                &AggSpec {
+                                    kind: *ak,
+                                    arg: Expr::Lit(Value::Int(1)),
+                                    distinct: false,
+                                    filter: None,
+                                },
+                                &refs,
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The window pass: evaluates every collected window call over the
+    /// given rows (with a per-row context builder) and returns one extra
+    /// column per call, in `wins` order.
+    fn winpass(
+        &self,
+        wins: &[Expr],
+        scope: &Scope,
+        rows: &[Vec<Value>],
+        aggs: &[Vec<Value>],
+        params: &[Value],
+    ) -> R<Vec<Vec<Value>>> {
+        let n = rows.len();
+        // per row: partition keys, order keys, per-win args
+        let mut pkeys: Vec<Vec<Vec<Value>>> = Vec::with_capacity(wins.len());
+        let mut okeys: Vec<Vec<Vec<Value>>> = Vec::with_capacity(wins.len());
+        let mut wargs: Vec<Vec<Vec<Value>>> = Vec::with_capacity(wins.len());
+        let mut wflags: Vec<Vec<bool>> = Vec::with_capacity(wins.len());
+        for _ in wins {
+            pkeys.push(Vec::with_capacity(n));
+            okeys.push(Vec::with_capacity(n));
+            wargs.push(Vec::with_capacity(n));
+            wflags.push(Vec::with_capacity(n));
+        }
+        for (i, row) in rows.iter().enumerate() {
+            let ctx = Ctx {
+                scope,
+                row,
+                aggs: aggs.get(i).map_or(&[][..], |a| &a[..]),
+                params,
+            };
+            for (wi, w) in wins.iter().enumerate() {
+                let (args_e, spec) = match w {
+                    Expr::Win { args, spec, .. } => (args, spec),
+                    _ => {
+                        return Err(PqError::new(
+                            "XX000",
+                            "internal error: non-window expression in window pass",
+                        ))
+                    }
+                };
+                let mut pk = Vec::with_capacity(spec.partition_by.len());
+                for e in &spec.partition_by {
+                    pk.push(eval(e, &ctx)?);
+                }
+                pkeys[wi].push(pk);
+                let mut ok = Vec::with_capacity(spec.order_by.len());
+                for (e, _, _) in &spec.order_by {
+                    ok.push(eval(e, &ctx)?);
+                }
+                okeys[wi].push(ok);
+                let mut av = Vec::with_capacity(args_e.len());
+                for e in args_e {
+                    av.push(eval(e, &ctx)?);
+                }
+                wargs[wi].push(av);
+                // FILTER (WHERE ...): does this row contribute?
+                let pass = match w {
+                    Expr::Win { filter: Some(f), .. } => {
+                        matches!(eval(f, &ctx)?, Value::Bool(true))
+                    }
+                    _ => true,
+                };
+                wflags[wi].push(pass);
+            }
+        }
+        let mut cols = Vec::with_capacity(wins.len());
+        for (wi, w) in wins.iter().enumerate() {
+            let (kind, spec) = match w {
+                Expr::Win { kind, spec, .. } => (kind, spec),
+                _ => {
+                    return Err(PqError::new(
+                        "XX000",
+                        "internal error: non-window expression in window pass",
+                    ))
+                }
+            };
+            let descs: Vec<(bool, bool)> =
+                spec.order_by.iter().map(|(_, d, nf)| (*d, *nf)).collect();
+            cols.push(Self::win_eval(
+                kind,
+                &spec.frame,
+                &descs,
+                &pkeys[wi],
+                &okeys[wi],
+                &wargs[wi],
+                &wflags[wi],
+            )?);
+        }
+        Ok(cols)
+    }
+
     fn select(&self, sel: &SelectStmt, params: &[Value]) -> R<StmtResult> {
+        // resolve OVER w references against the WINDOW clause (pure syntax,
+        // before anything evaluates). Also runs when there is no WINDOW
+        // clause at all: an OVER <name> then names something that does not
+        // exist (42704), never an empty spec.
+        let has_named_win = Self::collect_wins(sel).iter().any(|w| {
+            matches!(w, Expr::Win { spec, .. } if spec.name.is_some())
+        });
+        let sel_owned_w;
+        let sel = if sel.windows.is_empty() && !has_named_win {
+            sel
+        } else {
+            sel_owned_w = Self::resolve_sel_windows(sel)?;
+            &sel_owned_w
+        };
         // scalar subqueries are evaluated eagerly, once (v1.1: uncorrelated
         // only — a correlated outer reference fails resolution with a clean
         // 42703 rather than silently producing wrong results)
@@ -1829,12 +3686,37 @@ impl Db {
             .from_items
             .iter()
             .any(|fi| fi.base.as_of.is_some() || fi.joins.iter().any(|j| j.table.as_of.is_some()));
-        if VECTORIZED.load(Ordering::Relaxed) && !Self::items_have_subquery(sel) && !has_asof {
+        // window functions run on the reference executor only
+        let win_calls = Self::collect_wins(sel);
+        let win_q = !win_calls.is_empty();
+        // windows are only legal in the SELECT list and ORDER BY — the
+        // checks run regardless of win_q because a HAVING-only window
+        // leaves win_calls empty
+        for g in &sel.group_by {
+            if expr_has_win(g) {
+                return Err(PqError::syntax(
+                    "window functions are not allowed in GROUP BY",
+                ));
+            }
+        }
+        if let Some(h) = &sel.having {
+            if expr_has_win(h) {
+                return Err(PqError::syntax(
+                    "window functions are not allowed in HAVING",
+                ));
+            }
+        }
+        if VECTORIZED.load(Ordering::Relaxed)
+            && !Self::items_have_subquery(sel)
+            && !has_asof
+            && !win_q
+            && !cte_shadows_from(sel)
+        {
             if let Some(r) = self.select_vectorized(sel, params)? {
                 return Ok(r);
             }
         }
-        let (scope, rows) = self.scan_from(&sel.from_items, sel.where_.as_ref(), params)?;
+        let (mut scope, rows) = self.scan_from(&sel.from_items, sel.where_.as_ref(), params)?;
 
         // Expand stars up-front (needed for both description and grouping).
         let items: Vec<(Expr, Option<String>)> = expand_items(&sel.items, &scope)?;
@@ -1851,17 +3733,43 @@ impl Db {
 
         let group_by: Vec<Expr> = normalize_group_by(sel, &items, &out_cols, &scope);
 
-        // Split aggregate calls out of items, HAVING and ORDER BY.
+        // Window calls become __win_k column references; the values are
+        // computed by the window pass below (out_cols were inferred from
+        // the original expressions, so their types are right).
+        let items_r: Vec<(Expr, Option<String>)> = if win_q {
+            items
+                .iter()
+                .map(|(e, a)| (Self::replace_wins(e, &win_calls), a.clone()))
+                .collect()
+        } else {
+            items
+        };
+        let order_r: Vec<(Expr, bool, bool)> = if win_q {
+            sel.order_by
+                .iter()
+                .map(|(e, d, nf)| (Self::replace_wins(e, &win_calls), *d, *nf))
+                .collect()
+        } else {
+            sel.order_by.clone()
+        };
+
+        // Split aggregate calls out of items, HAVING and ORDER BY (aggregates
+        // nested inside window specs were already split from win_calls).
         let mut specs: Vec<AggSpec> = Vec::new();
-        let mut item_t: Vec<(Expr, Option<String>)> = items
+        let mut item_t: Vec<(Expr, Option<String>)> = items_r
             .iter()
             .map(|(e, a)| (split_aggs(e, &mut specs), a.clone()))
             .collect();
         let having_t = sel.having.as_ref().map(|h| split_aggs(h, &mut specs));
-        let order_t: Vec<(Expr, bool, bool)> = sel
-            .order_by
+        let order_t: Vec<(Expr, bool, bool)> = order_r
             .iter()
             .map(|(e, d, nf)| (split_aggs(e, &mut specs), *d, *nf))
+            .collect();
+        // window specs may embed aggregates (rank() OVER (ORDER BY sum(x))):
+        // split those with the same spec list
+        let win_t: Vec<Expr> = win_calls
+            .iter()
+            .map(|w| split_aggs(w, &mut specs))
             .collect();
 
         let agg_mode = !specs.is_empty() || !group_by.is_empty();
@@ -1882,6 +3790,28 @@ impl Db {
 
         if !agg_mode {
             // ---------------- plain projection ----------------
+            // window pass: one extra column per window call, exposed to
+            // items and ORDER BY as __win_k (windows run after WHERE)
+            let mut rows = rows;
+            if win_q {
+                let wcols = self.winpass(&win_t, &scope, &rows, &[], params)?;
+                let wnames: Vec<(String, Ty)> = win_calls
+                    .iter()
+                    .enumerate()
+                    .map(|(k, w)| (format!("__win_{}", k), infer_ty(w, &scope)))
+                    .collect();
+                scope.push("__win", wnames);
+                let n_w = win_calls.len();
+                let mut ext = Vec::with_capacity(rows.len());
+                for (i, mut r) in rows.into_iter().enumerate() {
+                    r.reserve(n_w);
+                    for c in &wcols {
+                        r.push(c[i].clone());
+                    }
+                    ext.push(r);
+                }
+                rows = ext;
+            }
             for row in &rows {
                 let ctx = Ctx {
                     scope: &scope,
@@ -1928,8 +3858,24 @@ impl Db {
             if let Some(h) = &having_t {
                 to_check.push(h);
             }
+
+            // window args / partition / order keys obey the same coverage
+            // rule (rank() OVER (ORDER BY v) with GROUP BY g is 42803 in PG)
+            for w in &win_t {
+                to_check.push(w);
+            }
             for e in to_check {
                 if let Some(c) = uncovered_col(e, &group_by) {
+                    // __win_k are window-pass pseudo columns (values are
+                    // computed per group by the window pass) — always covered
+                    let wname = match c {
+                        Expr::Col(n) => n,
+                        Expr::QCol(_, n) => n,
+                        _ => "",
+                    };
+                    if wname.starts_with("__win_") {
+                        continue;
+                    }
                     return Err(PqError::new(
                         "42803",
                         format!(
@@ -1965,6 +3911,118 @@ impl Db {
                 }
             }
 
+            // ---- window pass over groups (phase 1: collect rep rows +
+            // aggregate values; phase 2: window columns; phase 3: project) ----
+            if win_q {
+                let mut gdata: Vec<(Vec<Value>, Vec<Value>)> = Vec::new();
+                for grows in &groups {
+                    let empty_row: Vec<Value> = Vec::new();
+                    let rep_row = grows.first().map_or(&empty_row[..], |v| &v[..]);
+                    let mut agg_vals: Vec<Value> = Vec::with_capacity(specs.len());
+                    for spec in &specs {
+                        agg_vals.push(compute_agg(spec, grows, &scope, params)?);
+                    }
+                    let ctx = Ctx {
+                        scope: &scope,
+                        row: rep_row,
+                        aggs: &agg_vals,
+                        params,
+                    };
+                    if let Some(h) = &having_t {
+                        match eval(h, &ctx)? {
+                            Value::Bool(true) => {}
+                            _ => continue,
+                        }
+                    }
+                    gdata.push((rep_row.to_vec(), agg_vals));
+                }
+                let rep_rows: Vec<Vec<Value>> =
+                    gdata.iter().map(|(r, _)| r.clone()).collect();
+                let agg_rows: Vec<Vec<Value>> =
+                    gdata.iter().map(|(_, a)| a.clone()).collect();
+                // window args/partition/order evaluate with the group's
+                // aggregate values in ctx (AggRef) and the rep row
+                let wcols =
+                    self.winpass(&win_t, &scope, &rep_rows, &agg_rows, params)?;
+                let wnames: Vec<(String, Ty)> = win_calls
+                    .iter()
+                    .enumerate()
+                    .map(|(k, w)| (format!("__win_{}", k), infer_ty(w, &scope)))
+                    .collect();
+                let mut wscope = Scope::empty();
+                for t in &scope.tables {
+                    wscope.push(&t.alias, t.cols.clone());
+                }
+                wscope.push("__win", wnames);
+                for (gi, (rep_row, agg_vals)) in gdata.iter().enumerate() {
+                    let mut ext = rep_row.clone();
+                    for c in &wcols {
+                        ext.push(c[gi].clone());
+                    }
+                    let ctx = Ctx {
+                        scope: &wscope,
+                        row: &ext,
+                        aggs: agg_vals,
+                        params,
+                    };
+                    let r: R<Vec<Value>> =
+                        item_t.iter().map(|(e, _)| eval(e, &ctx)).collect();
+                    let r = r?;
+                    if !order_t.is_empty() {
+                        let mut keys = Vec::with_capacity(order_t.len());
+                        for (e, _, _) in &order_t {
+                            keys.push(match e {
+                                Expr::Lit(Value::Int(m)) if *m >= 1 && (*m as usize) <= r.len() => {
+                                    r[(*m - 1) as usize].clone()
+                                }
+                                Expr::Col(c) => {
+                                    if let Some(pos) =
+                                        out_cols.iter().position(|(n, _)| n == c)
+                                    {
+                                        r[pos].clone()
+                                    } else {
+                                        eval(e, &ctx)?
+                                    }
+                                }
+                                _ => eval(e, &ctx)?,
+                            });
+                        }
+                        order_keys.push(keys);
+                    }
+                    out_rows.push(r);
+                }
+                // windows over groups: skip the normal group loop
+                let _ = &groups;
+                if sel.distinct {
+                    let mut seen = std::collections::HashSet::new();
+                    let mut deduped = Vec::with_capacity(out_rows.len());
+                    for r in out_rows {
+                        let key: Vec<GK> = r.iter().map(gkey).collect();
+                        if seen.insert(key) {
+                            deduped.push(r);
+                        }
+                    }
+                    out_rows = deduped;
+                }
+                if !order_t.is_empty() {
+                    let descs: Vec<(bool, bool)> =
+                        sel.order_by.iter().map(|(_, d, nf)| (*d, *nf)).collect();
+                    let mut idx: Vec<usize> = (0..out_rows.len()).collect();
+                    idx.sort_by(|&a, &b| {
+                        for (i, (desc, nf)) in descs.iter().enumerate() {
+                            match order_cmp(&order_keys[a][i], &order_keys[b][i], *desc, *nf) {
+                                Ok(std::cmp::Ordering::Equal) => continue,
+                                Ok(o) => return o,
+                                Err(_) => return std::cmp::Ordering::Equal,
+                            }
+                        }
+                        std::cmp::Ordering::Equal
+                    });
+                    out_rows = idx.into_iter().map(|i| out_rows[i].clone()).collect();
+                }
+                // out_rows / order_keys are built; the shared DISTINCT /
+                // ORDER BY / LIMIT tail below finishes the statement
+            } else {
             for grows in &groups {
                 let empty_row: Vec<Value> = Vec::new();
                 let rep_row = grows.first().map_or(&empty_row[..], |v| &v[..]);
@@ -2010,6 +4068,7 @@ impl Db {
                     order_keys.push(keys);
                 }
                 out_rows.push(r);
+            }
             }
         }
 
@@ -2096,14 +4155,63 @@ impl Db {
 
     fn build_scope_schema(&self, from_items: &[FromItem], scope: &mut Scope) -> R<()> {
         for item in from_items {
-            let (cols, _) = self.load_table(&item.base)?;
+            let cols = self.table_ref_cols(&item.base)?;
             scope.push(item.base.effective_name(), apply_col_aliases(cols, &item.base));
             for j in &item.joins {
-                let (jcols, _) = self.load_table(&j.table)?;
+                let jcols = self.table_ref_cols(&j.table)?;
                 scope.push(j.table.effective_name(), apply_col_aliases(jcols, &j.table));
             }
         }
         Ok(())
+    }
+
+    /// Column schema of one FROM relation. Plain relations load from the
+    /// catalog; derived tables derive their schema without executing (a
+    /// recursive describe of the subquery — PG does the same at
+    /// parse-analysis time, so a subquery whose output is typed without
+    /// running is exactly right).
+    fn table_ref_cols(&self, tr: &TableRef) -> R<Vec<(String, Ty)>> {
+        if let Some(sq) = &tr.subquery {
+            return self.stmt_output_cols(sq);
+        }
+        if tr.func_args.is_none() {
+            if let Some(r) = cte_lookup_schema(self, &tr.name) {
+                return r;
+            }
+        }
+        let (cols, _) = self.load_table(tr, &[])?;
+        Ok(cols)
+    }
+
+    /// Output columns of a statement used as a derived table / CTE body.
+    fn stmt_output_cols(&self, sq: &Stmt) -> R<Vec<(String, Ty)>> {
+        match sq {
+            Stmt::Select(sel) => self.describe(sel),
+            Stmt::Values { rows, .. } => {
+                // column1..columnN (PG); type from the first row's literal
+                // shape, text when not a plain literal
+                let w = rows.first().map(|r| r.len()).unwrap_or(0);
+                Ok((0..w)
+                    .map(|i| {
+                        let t = match rows.first().map(|r| &r[i]) {
+                            Some(Expr::Lit(Value::Int(_))) => Ty::Int,
+                            Some(Expr::Lit(Value::Float(_))) => Ty::Float,
+                            Some(Expr::Lit(Value::Bool(_))) => Ty::Bool,
+                            _ => Ty::Text,
+                        };
+                        (format!("column{}", i + 1), t)
+                    })
+                    .collect())
+            }
+            Stmt::Union { arms, .. } => self.stmt_output_cols(&arms[0]),
+            Stmt::With { ctes, body, .. } => {
+                with_cte_frame(ctes.clone(), || self.stmt_output_cols(body))
+            }
+            _ => Err(PqError::new(
+                "42609",
+                "subquery in FROM must be a SELECT or UNION",
+            )),
+        }
     }
 
     /// Set-returning functions usable in FROM. Only generate_series is
@@ -2158,7 +4266,31 @@ impl Db {
         Ok((vec![(colname, Ty::Int)], rows))
     }
 
-    fn load_table(&self, tr: &TableRef) -> R<TableShape> {
+    fn load_table(&self, tr: &TableRef, params: &[Value]) -> R<TableShape> {
+        // derived table: execute the subquery wholesale and adopt its
+        // output as the relation (PG semantics: the subquery is fully
+        // isolated; outer-query columns are not visible inside it)
+        if let Some(sq) = &tr.subquery {
+            if tr.as_of.is_some() {
+                return Err(PqError::new("0A000", "AS OF is not supported on subqueries"));
+            }
+            return match self.execute(sq, params)? {
+                StmtResult::Rows { cols, rows, .. } => Ok((cols, rows)),
+                StmtResult::Tag(t) => Err(PqError::new(
+                    "42609",
+                    format!(
+                        "subquery in FROM cannot return a non-SELECT result ({})",
+                        t
+                    ),
+                )),
+            };
+        }
+        // CTE names shadow catalog relations (innermost WITH first)
+        if tr.func_args.is_none() {
+            if let Some(r) = cte_lookup_rows(self, &tr.name, params) {
+                return r;
+            }
+        }
         // set-returning function in FROM position
         if let Some(args) = &tr.func_args {
             if tr.as_of.is_some() {
@@ -2261,7 +4393,7 @@ impl Db {
         let mut scope = Scope::empty();
         let mut rows: Vec<Vec<Value>> = vec![Vec::new()];
         for item in from_items {
-            let (cols, trows) = self.load_table(&item.base)?;
+            let (cols, trows) = self.load_table(&item.base, params)?;
             scope.push(
                 item.base.effective_name(),
                 apply_col_aliases(cols, &item.base),
@@ -2277,8 +4409,10 @@ impl Db {
             }
             rows = out;
             for j in &item.joins {
-                let (jcols, jrows) = self.load_table(&j.table)?;
+                let (jcols, jrows) = self.load_table(&j.table, params)?;
                 let rwidth = jcols.len();
+                // width of the accumulated left side (for RIGHT/FULL NULL padding)
+                let lwidth = scope.width();
                 scope.push(
                     j.table.effective_name(),
                     apply_col_aliases(jcols, &j.table),
@@ -2308,10 +4442,17 @@ impl Db {
                             }
                         }
                     }
-                    JoinKind::Left => {
+                    JoinKind::Left | JoinKind::Right | JoinKind::Full => {
+                        // outer joins: track which side rows found a match.
+                        // matched pairs are emitted left-major (same order as
+                        // the vectorized hash_join), unmatched right rows are
+                        // appended at the end — one contract, both executors.
+                        let keep_left = j.kind != JoinKind::Right;
+                        let keep_right = j.kind != JoinKind::Left;
+                        let mut right_matched = vec![false; jrows.len()];
                         for l in &rows {
                             let mut matched = false;
-                            for r in &jrows {
+                            for (rj, r) in jrows.iter().enumerate() {
                                 let mut c = l.clone();
                                 c.extend(r.iter().cloned());
                                 let ok = match &j.on {
@@ -2329,12 +4470,22 @@ impl Db {
                                 if ok {
                                     out.push(c);
                                     matched = true;
+                                    right_matched[rj] = true;
                                 }
                             }
-                            if !matched {
+                            if !matched && keep_left {
                                 let mut c = l.clone();
                                 c.extend(std::iter::repeat_n(Value::Null, rwidth));
                                 out.push(c);
+                            }
+                        }
+                        if keep_right {
+                            for (rj, r) in jrows.iter().enumerate() {
+                                if !right_matched[rj] {
+                                    let mut c = vec![Value::Null; lwidth];
+                                    c.extend(r.iter().cloned());
+                                    out.push(c);
+                                }
                             }
                         }
                     }
@@ -2440,16 +4591,19 @@ pub struct AggSpec {
     pub kind: AggKind,
     pub arg: Expr,
     pub distinct: bool,
+    /// FILTER (WHERE ...): rows failing it do not contribute
+    pub filter: Option<Box<Expr>>,
 }
 
 /// Replaces aggregate calls with AggRef placeholders, collecting their specs.
 pub fn split_aggs(e: &Expr, specs: &mut Vec<AggSpec>) -> Expr {
     match e {
-        Expr::Agg(k, a, d) => {
+        Expr::Agg(k, a, d, f) => {
             specs.push(AggSpec {
                 kind: *k,
                 arg: (**a).clone(),
                 distinct: *d,
+                filter: f.clone(),
             });
             Expr::AggRef(specs.len() - 1)
         }
@@ -2470,6 +4624,26 @@ pub fn split_aggs(e: &Expr, specs: &mut Vec<AggSpec>) -> Expr {
             l.iter().map(|x| split_aggs(x, specs)).collect(),
             *n,
         ),
+        // InSub is lowered to InList by rewrite_expr_subs before this runs
+        Expr::InSub(..) => e.clone(),
+        // window specs may contain aggregates (rank() OVER (ORDER BY sum(x)));
+        // split them into AggRefs of the same spec list so the group pass
+        // computes them and the window pass reads them via ctx.aggs
+        Expr::Win { kind, args, spec, filter } => Expr::Win {
+            kind: kind.clone(),
+            args: args.iter().map(|a| split_aggs(a, specs)).collect(),
+            spec: Box::new(crate::sql::WindowSpec {
+                name: spec.name.clone(),
+                partition_by: spec.partition_by.iter().map(|a| split_aggs(a, specs)).collect(),
+                order_by: spec
+                    .order_by
+                    .iter()
+                    .map(|(e, d, nf)| (split_aggs(e, specs), *d, *nf))
+                    .collect(),
+                frame: spec.frame.clone(),
+            }),
+            filter: filter.clone(),
+        },
         Expr::Between(a, lo, hi, n) => Expr::Between(
             Box::new(split_aggs(a, specs)),
             Box::new(split_aggs(lo, specs)),
@@ -2512,9 +4686,26 @@ fn compute_agg(spec: &AggSpec, rows: &[Vec<Value>], scope: &Scope, params: &[Val
         };
         eval(&spec.arg, &ctx)
     };
+    // FILTER (WHERE ...): rows failing the predicate contribute nothing
+    let keep = |r: &Vec<Value>| -> R<bool> {
+        match &spec.filter {
+            Some(f) => {
+                let ctx = Ctx {
+                    scope,
+                    row: r,
+                    aggs: &[],
+                    params,
+                };
+                Ok(matches!(eval(f, &ctx)?, Value::Bool(true)))
+            }
+            None => Ok(true),
+        }
+    };
     let mut vals = Vec::with_capacity(rows.len());
     for r in rows {
-        vals.push(eval_arg(r)?);
+        if keep(r)? {
+            vals.push(eval_arg(r)?);
+        }
     }
     let refs: Vec<&Value> = vals.iter().collect();
     compute_agg_vals(spec, &refs)
@@ -2710,6 +4901,14 @@ pub fn eval(e: &Expr, ctx: &Ctx) -> R<Value> {
         Expr::Lit(v) => Ok(v.clone()),
         // subqueries are rewritten to literals before evaluation; reaching
         // this arm means an unrewritten path (internal error, not user error)
+        Expr::InSub(..) => Err(PqError::new(
+            "XX000",
+            "internal error: unevaluated IN-subquery",
+        )),
+        Expr::Win { .. } => Err(PqError::new(
+            "XX000",
+            "internal error: unevaluated window function call",
+        )),
         Expr::Subquery(_) => Err(PqError::new(
             "XX000",
             "internal error: unevaluated scalar subquery",
@@ -3658,6 +5857,34 @@ pub fn coerce(v: Value, ty: Ty) -> R<Value> {
     }
 }
 
+/// True if the expression contains a window call (used for the
+/// GROUP BY / HAVING restriction checks).
+pub fn expr_has_win(e: &Expr) -> bool {
+    fn walk(e: &Expr) -> bool {
+        match e {
+            Expr::Win { .. } => true,
+            Expr::Neg(a) | Expr::Not(a) | Expr::IsNull(a, _) | Expr::Cast(a, _) => walk(a),
+            Expr::Like(a, b, _) | Expr::Between(a, b, _, _) => walk(a) || walk(b),
+            Expr::InList(a, l, _) => walk(a) || l.iter().any(walk),
+            Expr::InSub(a, _, _) => walk(a),
+            Expr::Bin(a, _, b) => walk(a) || walk(b),
+            Expr::Case {
+                operand,
+                when_then,
+                else_,
+            } => {
+                operand.as_ref().is_some_and(|o| walk(o))
+                    || when_then.iter().any(|(w, t)| walk(w) || walk(t))
+                    || else_.as_ref().is_some_and(|x| walk(x))
+            }
+            Expr::Func(_, args) => args.iter().any(walk),
+            Expr::Agg(_, a, _, _) => walk(a),
+            _ => false,
+        }
+    }
+    walk(e)
+}
+
 pub fn expr_name(e: &Expr) -> String {
     match e {
         Expr::Col(c) => c.clone(),
@@ -3668,13 +5895,40 @@ pub fn expr_name(e: &Expr) -> String {
         Expr::Lit(Value::Text(_)) => "text".into(),
         Expr::Lit(Value::Null) => "unknown".into(),
         Expr::Param(_) => "?column?".into(),
+        Expr::Win { kind, .. } => win_name(kind).into(),
         _ => "?column?".into(),
+    }
+}
+
+/// Output column name for a window call (PG names it after the function).
+pub fn win_name(kind: &crate::sql::WinKind) -> &'static str {
+    use crate::sql::WinKind::*;
+    match kind {
+        RowNumber => "row_number",
+        Rank => "rank",
+        DenseRank => "dense_rank",
+        PercentRank => "percent_rank",
+        CumeDist => "cume_dist",
+        Ntile => "ntile",
+        Lag => "lag",
+        Lead => "lead",
+        FirstValue => "first_value",
+        LastValue => "last_value",
+        NthValue => "nth_value",
+        Agg(k) => match k {
+            AggKind::CountStar | AggKind::Count => "count",
+            AggKind::Sum => "sum",
+            AggKind::Avg => "avg",
+            AggKind::Min => "min",
+            AggKind::Max => "max",
+        },
     }
 }
 
 pub fn infer_ty(e: &Expr, scope: &Scope) -> Ty {
     match e {
         Expr::Subquery(_) => Ty::Text,
+        Expr::InSub(..) => Ty::Bool,
         Expr::Lit(Value::Int(_)) => Ty::Int,
         Expr::Lit(Value::Float(_)) => Ty::Float,
         Expr::Lit(Value::Bool(_)) => Ty::Bool,
@@ -3692,7 +5946,33 @@ pub fn infer_ty(e: &Expr, scope: &Scope) -> Ty {
             Err(_) => Ty::Text,
         },
         Expr::AggRef(_) => Ty::Text,
-        Expr::Agg(kind, arg, _) => match kind {
+        Expr::Win { kind, args, .. } => match kind {
+            crate::sql::WinKind::RowNumber
+            | crate::sql::WinKind::Rank
+            | crate::sql::WinKind::DenseRank
+            | crate::sql::WinKind::Ntile => Ty::Int,
+            crate::sql::WinKind::PercentRank | crate::sql::WinKind::CumeDist => Ty::Float,
+            crate::sql::WinKind::Lag
+            | crate::sql::WinKind::Lead
+            | crate::sql::WinKind::FirstValue
+            | crate::sql::WinKind::LastValue
+            | crate::sql::WinKind::NthValue => {
+                args.first().map_or(Ty::Text, |a| infer_ty(a, scope))
+            }
+            crate::sql::WinKind::Agg(k) => match k {
+                AggKind::CountStar | AggKind::Count => Ty::Int,
+                AggKind::Avg => Ty::Float,
+                AggKind::Sum => match args.first().map_or(Ty::Float, |a| infer_ty(a, scope)) {
+                    Ty::Int => Ty::Int,
+                    Ty::Interval => Ty::Interval,
+                    _ => Ty::Float,
+                },
+                AggKind::Min | AggKind::Max => {
+                    args.first().map_or(Ty::Text, |a| infer_ty(a, scope))
+                }
+            },
+        },
+        Expr::Agg(kind, arg, _, _) => match kind {
             AggKind::CountStar | AggKind::Count => Ty::Int,
             AggKind::Avg => Ty::Float,
             AggKind::Sum => {
@@ -3850,6 +6130,12 @@ fn uncovered_col<'a>(e: &'a Expr, groups: &[Expr]) -> Option<&'a Expr> {
             .or_else(|| uncovered_col(hi, groups)),
         Expr::InList(a, l, _) => uncovered_col(a, groups)
             .or_else(|| l.iter().find_map(|x| uncovered_col(x, groups))),
+        Expr::InSub(a, _, _) => uncovered_col(a, groups),
+        Expr::Win { args, spec, .. } => args
+            .iter()
+            .chain(spec.partition_by.iter())
+            .chain(spec.order_by.iter().map(|(e, _, _)| e))
+            .find_map(|e| uncovered_col(e, groups)),
         Expr::Bin(a, _, b) => {
             uncovered_col(a, groups).or_else(|| uncovered_col(b, groups))
         }
@@ -3919,6 +6205,19 @@ impl Db {
             return Ok(None);
         }
         let item = &sel.from_items[0];
+        // the vectorized path resolves tables by NAME from the catalog; any
+        // non-plain table ref (derived subquery, set-returning function,
+        // AS OF time travel) must go through the reference executor, which
+        // knows how to execute them. A derived table aliased to the name of
+        // a real table would otherwise silently read the real table.
+        for tr in std::iter::once(&item.base).chain(item.joins.iter().map(|j| &j.table)) {
+            if tr.subquery.is_some() || tr.func_args.is_some() || tr.as_of.is_some() {
+                if dbg {
+                    eprintln!("[vecx] fallback: derived/function/as-of table ref");
+                }
+                return Ok(None);
+            }
+        }
         if item.joins.is_empty() {
             // single table: pure borrowed-columns scan
             let guard = self.tables.read().unwrap_or_else(|e| e.into_inner());
@@ -4051,8 +6350,8 @@ impl Db {
                     if j.kind == JoinKind::Inner {
                         residual.push(c);
                     } else {
-                        if dbg { eprintln!("[vecx] fallback: LEFT join non-equi conjunct"); }
-                        return Ok(None); // LEFT JOIN needs pure equi conditions
+                        if dbg { eprintln!("[vecx] fallback: outer join non-equi conjunct"); }
+                        return Ok(None); // outer joins need pure equi conditions
                     }
                 }
             }
@@ -4101,14 +6400,28 @@ impl Db {
                 .iter()
                 .map(|e| veval(e, &src, &(0..ln).collect::<Vec<_>>(), &scope, params))
                 .collect::<R<Vec<_>>>()?;
-            let pairs = hash_join(ln, &left_keys, &right_keys, plan.kind == JoinKind::Left);
+            let mode = match plan.kind {
+                JoinKind::Inner | JoinKind::Cross => JoinMode::Inner,
+                JoinKind::Left => JoinMode::Left,
+                JoinKind::Right => JoinMode::Right,
+                JoinKind::Full => JoinMode::Full,
+            };
+            let pairs = hash_join(ln, &left_keys, &right_keys, mode);
             // materialize the joined source
             let lw = src.width();
             let rw = right.columns.len();
             let mut cols: Vec<Vec<Value>> = Vec::with_capacity(lw + rw);
             for c in 0..lw {
                 let old = src.col(c);
-                cols.push(pairs.iter().map(|(i, _)| old[*i].clone()).collect());
+                cols.push(
+                    pairs
+                        .iter()
+                        .map(|(i, _)| match i {
+                            Some(i) => old[*i].clone(),
+                            None => Value::Null,
+                        })
+                        .collect(),
+                );
             }
             for c in 0..rw {
                 cols.push(
@@ -4212,6 +6525,95 @@ impl Db {
                 .iter()
                 .map(|(e, _)| veval(e, src, &sel_idx, scope, params))
                 .collect::<R<Vec<_>>>()?;
+            // ---- top-k fast path: ORDER BY + LIMIT without OFFSET-side
+            // effects, no DISTINCT. Bounded selection over columnar keys —
+            // never materializes the n output rows, only offset+limit of
+            // them. Same comparator as the full sort, so results (including
+            // tie order) are identical to the reference path.
+            let const_int = |e: &Expr| -> Option<i64> {
+                match eval(e, &Ctx { scope, row: &[], aggs: &[], params }) {
+                    Ok(Value::Int(v)) => Some(v),
+                    _ => None,
+                }
+            };
+            let topk_bound: Option<usize> = match (&sel.limit, !order_t.is_empty() && !sel.distinct)
+            {
+                (Some(l), true) => match (const_int(l), sel.offset.as_ref()) {
+                    (Some(l), None) if l >= 0 => Some(l as usize),
+                    (Some(l), Some(o)) => match const_int(o) {
+                        Some(o) if o >= 0 && l >= 0 => Some((o as usize).saturating_add(l as usize)),
+                        _ => None,
+                    },
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(bound) = topk_bound.filter(|&b| b < nsel.saturating_sub(1)) {
+                let descs: Vec<(bool, bool)> =
+                    sel.order_by.iter().map(|(_, d, nf)| (*d, *nf)).collect();
+                let mut keycols: Vec<Vec<Value>> = Vec::with_capacity(order_t.len());
+                for (e, _, _) in &order_t {
+                    keycols.push(match e {
+                        Expr::Lit(Value::Int(k)) if *k >= 1 && (*k as usize) <= ocols.len() => {
+                            ocols[(*k - 1) as usize].clone()
+                        }
+                        Expr::Col(c) => {
+                            if let Some(pos) = out_cols.iter().position(|(nm, _)| nm == c) {
+                                ocols[pos].clone()
+                            } else {
+                                veval(e, src, &sel_idx, scope, params)?
+                            }
+                        }
+                        _ => veval(e, src, &sel_idx, scope, params)?,
+                    });
+                }
+                // ascending under the query's total order; ties keep
+                // original row order (stable, like the full sort)
+                let cmp_cols = |a: usize, b: usize| -> std::cmp::Ordering {
+                    for (ci, (desc, nf)) in descs.iter().enumerate() {
+                        match order_cmp(&keycols[ci][a], &keycols[ci][b], *desc, *nf) {
+                            Ok(std::cmp::Ordering::Equal) => continue,
+                            Ok(o) => return o,
+                            Err(_) => return std::cmp::Ordering::Equal,
+                        }
+                    }
+                    std::cmp::Ordering::Equal
+                };
+                let start = const_int(sel.offset.as_ref().unwrap_or(&Expr::Lit(Value::Int(0))))
+                    .unwrap_or(0)
+                    .max(0) as usize;
+                // amortized O(n) selection: collect into a 2*bound buffer,
+                // partition around the bound-th best whenever it fills, and
+                // drop the worst half. A sorted bounded heap would cost
+                // O(n*k) shifts on adversarial (pre-sorted) input.
+                let cap = bound.saturating_mul(2);
+                // tie-break on original index everywhere so that the
+                // kept subset AND its order are exactly what a stable
+                // full sort would produce (select_nth with an all-equal
+                // comparator would otherwise keep an arbitrary subset)
+                let cmp_stable = |a: usize, b: usize| cmp_cols(a, b).then(a.cmp(&b));
+                let mut buf: Vec<usize> = Vec::with_capacity(cap);
+                for i in 0..nsel {
+                    buf.push(i);
+                    if buf.len() >= cap {
+                        buf.select_nth_unstable_by(bound, |&a, &b| cmp_stable(a, b));
+                        buf.truncate(bound);
+                    }
+                }
+                if buf.len() > bound {
+                    buf.select_nth_unstable_by(bound, |&a, &b| cmp_stable(a, b));
+                }
+                buf.truncate(bound);
+                buf.sort_unstable_by(|&a, &b| cmp_stable(a, b));
+                for &j in buf.iter().skip(start.min(buf.len())) {
+                    out_rows.push(ocols.iter().map(|c| c[j].clone()).collect());
+                }
+                return Ok(Some(StmtResult::Rows {
+                    cols: out_cols,
+                    rows: out_rows,
+                    tag: "SELECT".into(),
+                }));
+            }
             for j in 0..nsel {
                 out_rows.push(ocols.iter().map(|c| c[j].clone()).collect());
             }
@@ -4248,6 +6650,16 @@ impl Db {
             }
             for e in to_check {
                 if let Some(c) = uncovered_col(e, &group_by) {
+                    // __win_k are window-pass pseudo columns (values are
+                    // computed per group by the window pass) — always covered
+                    let wname = match c {
+                        Expr::Col(n) => n,
+                        Expr::QCol(_, n) => n,
+                        _ => "",
+                    };
+                    if wname.starts_with("__win_") {
+                        continue;
+                    }
                     return Err(PqError::new(
                         "42803",
                         format!(
@@ -4285,8 +6697,23 @@ impl Db {
             let ngroups = rep.len().max(ngroups);
             let mut agg_vals: Vec<Vec<Value>> = vec![Vec::new(); ngroups];
             for (si, spec) in specs.iter().enumerate() {
+                // FILTER (WHERE ...): evaluated per selected row
+                let filt: Option<Vec<bool>> = match &spec.filter {
+                    Some(f) => Some(
+                        veval(f, src, &sel_idx, scope, params)?
+                            .into_iter()
+                            .map(|v| matches!(v, Value::Bool(true)))
+                            .collect(),
+                    ),
+                    None => None,
+                };
                 let mut by_group: Vec<Vec<&Value>> = vec![Vec::new(); ngroups];
                 for j in 0..nsel {
+                    if let Some(fs) = &filt {
+                        if !fs[j] {
+                            continue;
+                        }
+                    }
                     by_group[group_of[j]].push(&arg_vals[si][j]);
                 }
                 for gi in 0..ngroups {
@@ -4590,8 +7017,8 @@ mod tests {
 
     fn tab() -> Table {
         let cols = vec![
-            ColumnDef { name: "a".into(), ty: Ty::Int, not_null: false },
-            ColumnDef { name: "b".into(), ty: Ty::Text, not_null: false },
+            ColumnDef { name: "a".into(), ty: Ty::Int, not_null: false, primary_key: false, unique: false, default: None, check: None },
+            ColumnDef { name: "b".into(), ty: Ty::Text, not_null: false, primary_key: false, unique: false, default: None, check: None },
         ];
         let mut t = Table::empty(cols, 1);
         for i in 0..100i64 {
